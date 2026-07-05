@@ -1,0 +1,4 @@
+/dist/
+/aarvion-guard
+*.tmp
+.DS_Store

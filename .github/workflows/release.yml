@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Cross-compile binaries
+        run: make release VERSION=${{ github.ref_name }}
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum aarvion-guard_* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} dist/* --generate-notes
+
+  # macOS signing + notarization. Gated on secrets so the build above always
+  # ships Linux; fill APPLE_* secrets to enable (see OPENCLAW_GUARD_B_PLAN §8).
+  notarize-macos:
+    needs: build
+    runs-on: macos-latest
+    if: ${{ vars.ENABLE_MACOS_NOTARIZE == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build macOS binaries
+        run: |
+          GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o dist/aarvion-guard_darwin_amd64 ./cmd/guard
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o dist/aarvion-guard_darwin_arm64 ./cmd/guard
+      - name: Sign + notarize + staple
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          for f in dist/aarvion-guard_darwin_*; do
+            codesign --force --options runtime --timestamp --sign "$APPLE_DEVELOPER_ID" "$f"
+            ditto -c -k "$f" "$f.zip"
+            xcrun notarytool submit "$f.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          done
+      - name: Upload signed macOS binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} dist/aarvion-guard_darwin_* --clobber

@@ -56,7 +56,7 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	if dst.Port() == 443 {
-		s.deps.ServeTLS(conn, dst.String())
+		_ = s.deps.ServeTLS(conn, dst.String())
 		return
 	}
 	s.deps.ServePlain(conn, dst.String())

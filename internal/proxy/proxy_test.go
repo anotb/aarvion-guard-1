@@ -49,7 +49,7 @@ func fakeOPA(t *testing.T) *httptest.Server {
 	}))
 }
 
-func newGuard(t *testing.T, addr string) (*decisions.Recorder, *ca.CA) {
+func newGuard(t *testing.T, addr string, passthrough []string) (*decisions.Recorder, *ca.CA) {
 	t.Helper()
 	opa := fakeOPA(t)
 	t.Cleanup(opa.Close)
@@ -60,7 +60,7 @@ func newGuard(t *testing.T, addr string) (*decisions.Recorder, *ca.CA) {
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp")
-	srv := New(addr, authority, pol, rec, nil, nil, true)
+	srv := New(addr, authority, pol, rec, nil, passthrough, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
@@ -72,7 +72,7 @@ func newGuard(t *testing.T, addr string) (*decisions.Recorder, *ca.CA) {
 // method is seen, and it is denied — the shell-bypass fix.
 func TestConnectMitmDeniesHttpsWrite(t *testing.T) {
 	addr := "127.0.0.1:18901"
-	rec, authority := newGuard(t, addr)
+	rec, authority := newGuard(t, addr, nil)
 
 	// Open a CONNECT tunnel through the guard.
 	raw, err := net.Dial("tcp", addr)
@@ -126,7 +126,7 @@ func TestConnectMitmDeniesHttpsWrite(t *testing.T) {
 
 func TestForwardHttpGoverns(t *testing.T) {
 	addr := "127.0.0.1:18902"
-	rec, _ := newGuard(t, addr)
+	rec, _ := newGuard(t, addr, nil)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "upstream-ok")
 	}))
@@ -155,6 +155,63 @@ func TestForwardHttpGoverns(t *testing.T) {
 	}
 	if total, denies, _ := rec.Stats(); total < 2 || denies < 1 {
 		t.Fatalf("decisions not recorded: total=%d denies=%d", total, denies)
+	}
+}
+
+// A passthrough (cert-pinned) host is tunneled raw — not MITM'd — so bytes
+// flow through untouched after a host-level allow.
+func TestPassthroughSplices(t *testing.T) {
+	// Raw TCP echo server standing in for a cert-pinned upstream.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { _, _ = io.Copy(c, c); c.Close() }(c)
+		}
+	}()
+	upstreamHost, upstreamPort, _ := net.SplitHostPort(ln.Addr().String())
+
+	addr := "127.0.0.1:18903"
+	newGuard(t, addr, []string{upstreamHost})
+
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	target := net.JoinHostPort(upstreamHost, upstreamPort)
+	if _, err := raw.Write([]byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(raw)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("passthrough CONNECT not established: %q", status)
+	}
+	for {
+		line, _ := br.ReadString('\n')
+		if line == "\r\n" || line == "" {
+			break
+		}
+	}
+	// Raw bytes echo straight back — proof the guard spliced rather than MITM'd.
+	if _, err := raw.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("passthrough echo: got %q", buf)
 	}
 }
 

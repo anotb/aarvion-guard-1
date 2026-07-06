@@ -35,21 +35,24 @@ func Essentials(hosts []string) map[string]bool {
 }
 
 // ServeTLS terminates the client's TLS with a minted leaf, then governs each
-// HTTP request over it, forwarding allowed ones to dialAddr (host:port).
-func (d Deps) ServeTLS(client net.Conn, dialAddr string) {
+// HTTP request over it, forwarding allowed ones to dialAddr (host:port). A
+// non-nil return means the client rejected the MITM leaf (e.g. a cert-pinned
+// client) — the caller can then fall back to passthrough.
+func (d Deps) ServeTLS(client net.Conn, dialAddr string) error {
 	tlsConn := tls.Server(client, &tls.Config{
 		GetCertificate: d.CA.GetCertificate,
 		NextProtos:     []string{"http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		client.Close()
-		return
+		return err
 	}
 	transport := &http.Transport{
 		DialContext:     dialTo(dialAddr),
 		TLSClientConfig: &tls.Config{ServerName: tlsConn.ConnectionState().ServerName},
 	}
 	d.serve(tlsConn, "https", transport)
+	return nil
 }
 
 // ServePlain governs cleartext HTTP arriving on a raw connection.

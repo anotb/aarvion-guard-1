@@ -27,7 +27,9 @@ func ServiceEnvPath(openclawHome string) string {
 
 // InjectProxy appends the proxy env to OpenClaw's service-env, backing up the
 // original once. Idempotent: a prior aarvion block is replaced, not stacked.
-func InjectProxy(envPath, proxyURL string) error {
+// When caCertPath is set, NODE_EXTRA_CA_CERTS is added so OpenClaw's Node
+// runtime trusts the guard's intercepted TLS.
+func InjectProxy(envPath, proxyURL, caCertPath string) error {
 	if err := os.MkdirAll(filepath.Dir(envPath), 0o755); err != nil {
 		return err
 	}
@@ -43,7 +45,7 @@ func InjectProxy(envPath, proxyURL string) error {
 	}
 
 	cleaned := stripBlock(string(existing))
-	block := strings.Join([]string{
+	lines := []string{
 		marker,
 		fmt.Sprintf("export HTTPS_PROXY=%s", proxyURL),
 		fmt.Sprintf("export https_proxy=%s", proxyURL),
@@ -51,8 +53,12 @@ func InjectProxy(envPath, proxyURL string) error {
 		fmt.Sprintf("export http_proxy=%s", proxyURL),
 		"export NO_PROXY=127.0.0.1,localhost,::1",
 		"export no_proxy=127.0.0.1,localhost,::1",
-		"# --- end aarvion-guard ---",
-	}, "\n")
+	}
+	if caCertPath != "" {
+		lines = append(lines, fmt.Sprintf("export NODE_EXTRA_CA_CERTS=%s", caCertPath))
+	}
+	lines = append(lines, "# --- end aarvion-guard ---")
+	block := strings.Join(lines, "\n")
 
 	out := cleaned
 	if out != "" && !strings.HasSuffix(out, "\n") {

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"syscall"
@@ -27,8 +28,11 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/proxy"
 	"github.com/aarvion-ai/aarvion-guard/internal/svc"
 	"github.com/aarvion-ai/aarvion-guard/internal/tproxy"
+	"github.com/aarvion-ai/aarvion-guard/internal/trust"
 	"github.com/aarvion-ai/aarvion-guard/internal/wiring"
 )
+
+func caCertPath() string { return filepath.Join(config.CADir(), "ca.crt") }
 
 // version is overridden at build time: -ldflags "-X main.version=v0.1.0".
 var version = "dev"
@@ -90,6 +94,7 @@ func cmdInit(args []string) {
 	apiURL := fs.String("api", defaultAPIURL, "Aarvion backend base URL")
 	device := fs.String("device", "", "device name for this guard")
 	transparent := fs.Bool("transparent", false, "bypass-proof kernel interception (Linux; needs root at run)")
+	noInspect := fs.Bool("no-inspect", false, "govern HTTPS at host level only (no MITM, no CA trust)")
 
 	positional := parseInterspersed(fs, args)
 	if len(positional) < 1 {
@@ -132,6 +137,7 @@ func cmdInit(args []string) {
 		TransparentAddr: config.DefaultTransparentAddr,
 		GuardGroup:      config.DefaultGuardGroup,
 		OPAAddr:         defaultOPAAddr,
+		Inspect:         !*noInspect,
 	}
 	if err := cfg.Save(); err != nil {
 		fatal(err)
@@ -149,12 +155,26 @@ func cmdInit(args []string) {
 		return
 	}
 
+	caEnv := ""
+	if cfg.Inspect {
+		if _, err := ca.EnsureCA(config.CADir()); err != nil {
+			fatal(err)
+		}
+		caEnv = caCertPath()
+		if err := trust.Install(caEnv); err != nil {
+			fmt.Printf("! could not trust the guard CA: %v\n", err)
+			fmt.Println("  HTTPS interception will fail until it's trusted; re-run, or use --no-inspect for host-level only.")
+		} else {
+			fmt.Println("installed guard CA into the system trust store")
+		}
+	}
+
 	envPath := wiring.ServiceEnvPath(cfg.OpenClawHome)
 	if envPath == "" {
 		fmt.Println("! OpenClaw install not found under ~/.openclaw — proxy env not wired.")
 		fmt.Printf("  Set HTTPS_PROXY=http://%s manually, then run `aarvion-guard run`.\n", cfg.ProxyAddr)
 	} else {
-		if err := wiring.InjectProxy(envPath, "http://"+cfg.ProxyAddr); err != nil {
+		if err := wiring.InjectProxy(envPath, "http://"+cfg.ProxyAddr, caEnv); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("wired OpenClaw egress → guard (%s)\n", envPath)
@@ -200,12 +220,16 @@ func cmdRun() {
 	if cfg.Mode == config.ModeTransparent {
 		runTransparent(ctx, cfg, pol, rec)
 	} else {
-		authority, err := ca.EnsureCA(config.CADir())
-		if err != nil {
-			fatal(err)
+		var authority *ca.CA
+		if cfg.Inspect {
+			a, err := ca.EnsureCA(config.CADir())
+			if err != nil {
+				fatal(err)
+			}
+			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts, cfg.PassthroughHosts)
-		fmt.Printf("guard listening on http://%s (mode=forward, entity=%s)\n", cfg.ProxyAddr, cfg.EntityID)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts, cfg.PassthroughHosts, cfg.Inspect)
+		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
 		}
@@ -221,6 +245,9 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	authority, err := ca.EnsureCA(config.CADir())
 	if err != nil {
 		fatal(err)
+	}
+	if err := trust.Install(caCertPath()); err != nil {
+		fmt.Printf("! could not trust the guard CA: %v\n", err)
 	}
 
 	backend := intercept.New()
@@ -342,13 +369,17 @@ func cmdUninstall() {
 		fmt.Fprintln(os.Stderr, "nothing to uninstall")
 		return
 	}
+	if cfg.Inspect {
+		if err := trust.Remove(caCertPath()); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove guard CA trust: %v\n", err)
+		}
+	}
 	if cfg.Mode == config.ModeTransparent {
 		if err := intercept.New().Remove(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not remove redirect (run with sudo): %v\n", err)
 		} else {
 			fmt.Println("removed kernel redirect")
 		}
-		_ = os.RemoveAll(config.CADir())
 	} else if envPath := wiring.ServiceEnvPath(cfg.OpenClawHome); envPath != "" {
 		if err := wiring.Restore(envPath); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not restore OpenClaw env: %v\n", err)
@@ -356,6 +387,7 @@ func cmdUninstall() {
 			fmt.Println("restored OpenClaw egress (restart OpenClaw to drop the proxy)")
 		}
 	}
+	_ = os.RemoveAll(config.CADir())
 	_ = os.Remove(config.OPAConfigPath())
 	if err := os.Remove(config.Path()); err != nil {
 		fatal(err)

@@ -60,7 +60,7 @@ func newGuard(t *testing.T, addr string) (*decisions.Recorder, *ca.CA) {
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp")
-	srv := New(addr, authority, pol, rec, nil, nil)
+	srv := New(addr, authority, pol, rec, nil, nil, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()

@@ -26,6 +26,7 @@ type Config struct {
 	OPAAddr          string   `json:"opa_addr"`
 	OpenClawHome     string   `json:"openclaw_home"`
 	PassthroughHosts []string `json:"passthrough_hosts,omitempty"`
+	Inspect          bool     `json:"inspect"`
 }
 
 const (

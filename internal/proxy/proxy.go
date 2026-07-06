@@ -22,10 +22,11 @@ type Server struct {
 	addr        string
 	deps        mitm.Deps
 	passthrough map[string]bool
+	inspect     bool
 	transport   *http.Transport
 }
 
-func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string) *Server {
+func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool) *Server {
 	pt := map[string]bool{}
 	for _, h := range passthrough {
 		pt[strings.ToLower(h)] = true
@@ -34,6 +35,7 @@ func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recor
 		addr:        addr,
 		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential)},
 		passthrough: pt,
+		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},
 	}
 }
@@ -67,7 +69,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	if s.passthrough[host] {
+	if !s.inspect || s.passthrough[host] {
 		s.splice(w, r, host, hj)
 		return
 	}

@@ -12,7 +12,7 @@ const { spawnSync } = require('child_process')
 const REPO = 'aarvion-ai/aarvion-guard'
 // The release tag the binaries live under, decoupled from the npm package
 // version so shim-only fixes don't require rebuilding binaries.
-const BINARY_TAG = 'v0.2.0'
+const BINARY_TAG = 'v0.2.1'
 
 function assetName() {
   const platform = os.platform()

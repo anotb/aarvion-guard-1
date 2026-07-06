@@ -8,40 +8,38 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
+	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
 
-// Server is the B0 forward proxy: OpenClaw points HTTP(S)_PROXY at it. HTTPS is
-// governed at the host level via CONNECT; plain HTTP sees full method/path.
-// Transparent, body-level interception is B1.
+// Server is the forward proxy: OpenClaw points HTTP(S)_PROXY at it. HTTPS is
+// MITM'd inside the CONNECT tunnel (body-level governance) unless the host is
+// on the passthrough list (cert-pinned), in which case it is spliced host-level.
+// Plain HTTP is governed directly.
 type Server struct {
-	addr      string
-	pol       *policy.Client
-	rec       *decisions.Recorder
-	essential map[string]bool
-	transport *http.Transport
+	addr        string
+	deps        mitm.Deps
+	passthrough map[string]bool
+	transport   *http.Transport
 }
 
-func New(addr string, pol *policy.Client, rec *decisions.Recorder, essential []string) *Server {
-	set := map[string]bool{}
-	for _, h := range essential {
-		set[strings.ToLower(h)] = true
+func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string) *Server {
+	pt := map[string]bool{}
+	for _, h := range passthrough {
+		pt[strings.ToLower(h)] = true
 	}
 	return &Server{
-		addr:      addr,
-		pol:       pol,
-		rec:       rec,
-		essential: set,
-		transport: &http.Transport{Proxy: nil},
+		addr:        addr,
+		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential)},
+		passthrough: pt,
+		transport:   &http.Transport{Proxy: nil},
 	}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:    s.addr,
-		Handler: http.HandlerFunc(s.handle),
-	}
+	srv := &http.Server{Addr: s.addr, Handler: http.HandlerFunc(s.handle)}
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -62,39 +60,37 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.handleHTTP(w, r)
 }
 
-// decide evaluates OPA, applying the fail-closed-with-essential posture when
-// OPA can't be reached.
-func (s *Server) decide(method, host, path string) *policy.Decision {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	d, err := s.pol.Eval(ctx, method, host, path, map[string]string{})
-	if err == nil {
-		return d
-	}
-	if s.essential[strings.ToLower(host)] {
-		return &policy.Decision{Allowed: true, HTTPStatus: http.StatusOK, Reason: "opa_unavailable_essential", Enforced: true}
-	}
-	return &policy.Decision{Allowed: false, HTTPStatus: http.StatusServiceUnavailable, PolicyID: "guard", Reason: "policy_unavailable", Enforced: true}
-}
-
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	host := stripPort(r.Host)
-	d := s.decide(http.MethodConnect, host, "/")
-	latency := int(time.Since(start).Milliseconds())
-
-	if !d.Allowed {
-		s.rec.Add(http.MethodConnect, host, "/", "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
-		http.Error(w, d.Reason, d.HTTPStatus)
-		return
-	}
-	s.rec.Add(http.MethodConnect, host, "/", "allow", "", "", d.Redactions, d.Enforced, latency)
-
+	host := mitm.StripPort(r.Host)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
+	if s.passthrough[host] {
+		s.splice(w, r, host, hj)
+		return
+	}
+	client, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	s.deps.ServeTLS(client, r.Host)
+}
+
+// splice handles a passthrough (cert-pinned) host: host-level allow/deny, then
+// a raw byte tunnel with no inspection.
+func (s *Server) splice(w http.ResponseWriter, r *http.Request, host string, hj http.Hijacker) {
+	start := time.Now()
+	d := s.deps.Decide(http.MethodConnect, host, "/")
+	latency := int(time.Since(start).Milliseconds())
+	if !d.Allowed {
+		s.deps.Rec.Add(http.MethodConnect, host, "/", "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
+		http.Error(w, d.Reason, d.HTTPStatus)
+		return
+	}
+	s.deps.Rec.Add(http.MethodConnect, host, "/", "allow", "", "", d.Redactions, d.Enforced, latency)
 	upstream, err := net.DialTimeout("tcp", r.Host, 15*time.Second)
 	if err != nil {
 		http.Error(w, "upstream dial failed", http.StatusBadGateway)
@@ -116,16 +112,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	host := stripPort(r.Host)
-	d := s.decide(r.Method, host, r.URL.Path)
+	host := mitm.StripPort(r.Host)
+	d := s.deps.Decide(r.Method, host, r.URL.Path)
 	latency := int(time.Since(start).Milliseconds())
-
 	if !d.Allowed {
-		s.rec.Add(r.Method, host, r.URL.Path, "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
+		s.deps.Rec.Add(r.Method, host, r.URL.Path, "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
 		http.Error(w, d.Reason, d.HTTPStatus)
 		return
 	}
-	s.rec.Add(r.Method, host, r.URL.Path, "allow", "", "", d.Redactions, d.Enforced, latency)
+	s.deps.Rec.Add(r.Method, host, r.URL.Path, "allow", "", "", d.Redactions, d.Enforced, latency)
 
 	r.RequestURI = ""
 	resp, err := s.transport.RoundTrip(r)
@@ -147,11 +142,4 @@ func pipe(dst, src net.Conn) {
 	defer dst.Close()
 	defer src.Close()
 	_, _ = io.Copy(dst, src)
-}
-
-func stripPort(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
-	}
-	return hostport
 }

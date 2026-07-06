@@ -18,13 +18,14 @@ type Config struct {
 	SigningSecret   string `json:"signing_secret"`
 	BundleURL       string `json:"bundle_url"`
 
-	DPID            string `json:"dp_id"`
-	Mode            string `json:"mode"`
-	ProxyAddr       string `json:"proxy_addr"`
-	TransparentAddr string `json:"transparent_addr"`
-	GuardGroup      string `json:"guard_group"`
-	OPAAddr         string `json:"opa_addr"`
-	OpenClawHome    string `json:"openclaw_home"`
+	DPID             string   `json:"dp_id"`
+	Mode             string   `json:"mode"`
+	ProxyAddr        string   `json:"proxy_addr"`
+	TransparentAddr  string   `json:"transparent_addr"`
+	GuardGroup       string   `json:"guard_group"`
+	OPAAddr          string   `json:"opa_addr"`
+	OpenClawHome     string   `json:"openclaw_home"`
+	PassthroughHosts []string `json:"passthrough_hosts,omitempty"`
 }
 
 const (

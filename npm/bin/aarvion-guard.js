@@ -12,7 +12,7 @@ const { spawnSync } = require('child_process')
 const REPO = 'aarvion-ai/aarvion-guard'
 // The release tag the binaries live under, decoupled from the npm package
 // version so shim-only fixes don't require rebuilding binaries.
-const BINARY_TAG = 'v0.2.2'
+const BINARY_TAG = 'v0.2.3'
 
 function assetName() {
   const platform = os.platform()
@@ -81,7 +81,10 @@ async function main() {
     await download(url, bin)
     fs.chmodSync(bin, 0o755)
   }
-  const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' })
+  const r = spawnSync(bin, process.argv.slice(2), {
+    stdio: 'inherit',
+    env: { ...process.env, AARVION_GUARD_CMD: 'npx @aarvionai/guard' },
+  })
   process.exit(r.status === null ? 1 : r.status)
 }
 

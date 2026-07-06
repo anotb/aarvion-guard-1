@@ -89,6 +89,16 @@ usage:
   aarvion-guard version`)
 }
 
+// guardCmd is how the user invokes this binary (e.g. "npx @aarvionai/guard"),
+// passed in by the npm launcher so the printed next-steps are copy-pasteable.
+// Falls back to the binary name when the binary is run directly.
+func guardCmd() string {
+	if c := os.Getenv("AARVION_GUARD_CMD"); c != "" {
+		return c
+	}
+	return "aarvion-guard"
+}
+
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	apiURL := fs.String("api", defaultAPIURL, "Aarvion backend base URL")
@@ -150,8 +160,10 @@ func cmdInit(args []string) {
 
 	if cfg.Mode == config.ModeTransparent {
 		fmt.Println("next:")
-		fmt.Println("  1. sudo aarvion-guard run                       # installs the redirect + policy engine")
-		fmt.Printf("  2. aarvion-guard exec -- <start OpenClaw>        # runs it inside group %q\n", cfg.GuardGroup)
+		fmt.Printf("  1. sudo %s run\n", guardCmd())
+		fmt.Println("     # installs the redirect + policy engine")
+		fmt.Printf("  2. %s exec -- <start OpenClaw>\n", guardCmd())
+		fmt.Printf("     # runs it inside group %q\n", cfg.GuardGroup)
 		return
 	}
 
@@ -164,7 +176,7 @@ func cmdInit(args []string) {
 		fmt.Println("trusting the guard CA (may prompt for your password)...")
 		if err := trust.Install(caEnv); err != nil {
 			fmt.Printf("! could not trust the guard CA: %v\n", err)
-			fmt.Printf("  run it yourself, then `aarvion-guard run`:\n    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s\n", caEnv)
+			fmt.Printf("  run it yourself, then `%s run`:\n    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s\n", guardCmd(), caEnv)
 			fmt.Println("  or re-init with --no-inspect for host-level governance only.")
 		} else {
 			fmt.Println("installed guard CA into the system trust store")
@@ -174,7 +186,7 @@ func cmdInit(args []string) {
 	envPath := wiring.ServiceEnvPath(cfg.OpenClawHome)
 	if envPath == "" {
 		fmt.Println("! OpenClaw install not found under ~/.openclaw — proxy env not wired.")
-		fmt.Printf("  Set HTTPS_PROXY=http://%s manually, then run `aarvion-guard run`.\n", cfg.ProxyAddr)
+		fmt.Printf("  Set HTTPS_PROXY=http://%s manually, then run `%s run`.\n", cfg.ProxyAddr, guardCmd())
 	} else {
 		if err := wiring.InjectProxy(envPath, "http://"+cfg.ProxyAddr, caEnv); err != nil {
 			fatal(err)
@@ -182,8 +194,14 @@ func cmdInit(args []string) {
 		fmt.Printf("wired OpenClaw egress → guard (%s)\n", envPath)
 	}
 	fmt.Println("next:")
-	fmt.Println("  1. aarvion-guard run          # start the guard + policy engine")
-	fmt.Println("  2. restart OpenClaw           # so it picks up the proxy env")
+	fmt.Printf("  1. %s run\n", guardCmd())
+	fmt.Println("     # start the guard + policy engine")
+	if runtime.GOOS == "darwin" {
+		fmt.Println("  2. launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway")
+		fmt.Println("     # restart OpenClaw so it picks up the proxy")
+	} else {
+		fmt.Println("  2. restart OpenClaw so it picks up the proxy")
+	}
 }
 
 func cmdRun() {

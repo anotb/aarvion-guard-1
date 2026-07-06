@@ -200,7 +200,11 @@ func cmdRun() {
 	if cfg.Mode == config.ModeTransparent {
 		runTransparent(ctx, cfg, pol, rec)
 	} else {
-		srv := proxy.New(cfg.ProxyAddr, pol, rec, essentialHosts)
+		authority, err := ca.EnsureCA(config.CADir())
+		if err != nil {
+			fatal(err)
+		}
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts, cfg.PassthroughHosts)
 		fmt.Printf("guard listening on http://%s (mode=forward, entity=%s)\n", cfg.ProxyAddr, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)

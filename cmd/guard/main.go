@@ -90,13 +90,13 @@ func cmdInit(args []string) {
 	apiURL := fs.String("api", defaultAPIURL, "Aarvion backend base URL")
 	device := fs.String("device", "", "device name for this guard")
 	transparent := fs.Bool("transparent", false, "bypass-proof kernel interception (Linux; needs root at run)")
-	_ = fs.Parse(args)
 
-	if fs.NArg() < 1 {
+	positional := parseInterspersed(fs, args)
+	if len(positional) < 1 {
 		fmt.Fprintln(os.Stderr, "error: pairing code required")
 		os.Exit(2)
 	}
-	code := fs.Arg(0)
+	code := positional[0]
 
 	if config.Exists() {
 		fmt.Fprintln(os.Stderr, "error: already initialized; run `aarvion-guard uninstall` first")
@@ -357,6 +357,22 @@ func cmdUninstall() {
 		fatal(err)
 	}
 	fmt.Println("guard uninstalled (entity kept in dashboard; delete it there to fully remove)")
+}
+
+// parseInterspersed lets flags appear before or after positional args, so
+// `init <code> --api <url>` works the same as `init --api <url> <code>`
+// (Go's flag package otherwise stops parsing at the first positional).
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		args = fs.Args()
+		if len(args) == 0 {
+			return positional
+		}
+		positional = append(positional, args[0])
+		args = args[1:]
+	}
 }
 
 func ensureGroup(name string) (int, error) {

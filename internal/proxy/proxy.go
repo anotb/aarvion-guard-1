@@ -112,7 +112,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // a raw byte tunnel with no inspection.
 func (s *Server) splice(w http.ResponseWriter, r *http.Request, host string, hj http.Hijacker) {
 	start := time.Now()
-	d := s.deps.Decide(http.MethodConnect, host, "/")
+	d := s.deps.Decide(http.MethodConnect, host, "/", "")
 	latency := int(time.Since(start).Milliseconds())
 	if !d.Allowed {
 		s.deps.Rec.Add(http.MethodConnect, host, "/", "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
@@ -142,7 +142,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	host := mitm.StripPort(r.Host)
-	d := s.deps.Decide(r.Method, host, r.URL.Path)
+	d := s.deps.Decide(r.Method, host, r.URL.Path, mitm.PeekBody(r))
 	latency := int(time.Since(start).Milliseconds())
 	if !d.Allowed {
 		s.deps.Rec.Add(r.Method, host, r.URL.Path, "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)

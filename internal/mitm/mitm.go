@@ -1,6 +1,7 @@
 package mitm
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"io"
@@ -14,6 +15,12 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
+
+// maxBodyPeek bounds how much of a request body is buffered for policy
+// inspection. The only body-level matcher is the GraphQL mutation name, whose
+// payload is tiny; larger writes (git push, asset uploads) are governed by
+// method+path and stream through without being fully buffered.
+const maxBodyPeek = 1 << 20
 
 // Deps is the shared body-level governance core used by both the forward proxy
 // (inside a CONNECT tunnel) and the transparent server. It terminates TLS with
@@ -62,10 +69,10 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 
 // Decide evaluates OPA for one request, applying the fail-closed-with-essential
 // posture when OPA can't be reached.
-func (d Deps) Decide(method, host, path string) *policy.Decision {
+func (d Deps) Decide(method, host, path, body string) *policy.Decision {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	dec, err := d.Pol.Eval(ctx, method, host, path, map[string]string{})
+	dec, err := d.Pol.Eval(ctx, method, host, path, body, map[string]string{})
 	if err == nil {
 		return dec
 	}
@@ -87,7 +94,7 @@ func (d Deps) serve(conn net.Conn, scheme string, transport *http.Transport) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		host := StripPort(r.Host)
-		dec := d.Decide(r.Method, host, r.URL.Path)
+		dec := d.Decide(r.Method, host, r.URL.Path, PeekBody(r))
 		latency := int(time.Since(start).Milliseconds())
 		if !dec.Allowed {
 			d.Rec.Add(r.Method, host, r.URL.Path, "deny", dec.PolicyID, dec.Reason, "", dec.Enforced, latency)
@@ -101,6 +108,25 @@ func (d Deps) serve(conn net.Conn, scheme string, transport *http.Transport) {
 	})
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 20 * time.Second}
 	_ = srv.Serve(&oneConnListener{conn: conn})
+}
+
+// PeekBody buffers up to maxBodyPeek bytes of the request body for policy
+// inspection and restores r.Body so the request forwards upstream unchanged.
+// A body larger than the cap is not returned for inspection but still streams
+// through intact.
+func PeekBody(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	peek, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyPeek))
+	var overflow [1]byte
+	n, _ := io.ReadFull(r.Body, overflow[:])
+	if n == 0 {
+		r.Body = io.NopCloser(bytes.NewReader(peek))
+		return string(peek)
+	}
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), bytes.NewReader(overflow[:n]), r.Body))
+	return ""
 }
 
 func dialTo(addr string) func(context.Context, string, string) (net.Conn, error) {

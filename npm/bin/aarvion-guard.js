@@ -52,11 +52,20 @@ function download(url, dest) {
             res.resume()
             return fail(new Error(`download ${u} failed: ${statusCode}`))
           }
+          const expected = parseInt(headers['content-length'] || '0', 10)
           const file = fs.createWriteStream(dest, { mode: 0o755 })
           file.on('error', fail)
           res.on('error', fail)
           res.pipe(file)
-          file.on('finish', () => file.close(() => resolve()))
+          file.on('finish', () =>
+            file.close(() => {
+              if (expected && fs.statSync(dest).size !== expected) {
+                fs.rmSync(dest, { force: true })
+                return reject(new Error('download truncated; please retry'))
+              }
+              resolve()
+            }),
+          )
         })
         .on('error', fail)
     get(url)
@@ -66,7 +75,7 @@ function download(url, dest) {
 async function main() {
   const name = assetName()
   const bin = cachePath(name)
-  if (!fs.existsSync(bin) || fs.statSync(bin).size === 0) {
+  if (!fs.existsSync(bin) || fs.statSync(bin).size < 1_000_000) {
     const url = `https://github.com/${REPO}/releases/download/${BINARY_TAG}/${name}`
     process.stderr.write(`downloading aarvion-guard ${BINARY_TAG}...\n`)
     await download(url, bin)

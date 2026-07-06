@@ -4,33 +4,25 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 )
 
 const linuxCertPath = "/usr/local/share/ca-certificates/aarvion-guard.crt"
 
 // Install makes the guard CA trusted so intercepted TLS validates for
-// system-trust-store clients (gh, git, curl, Go). On macOS this prompts once
-// for admin. OpenClaw's Node runtime is handled separately via
-// NODE_EXTRA_CA_CERTS in the service-env.
+// system-trust-store clients (gh, git, curl, Go). Writing to the system trust
+// store needs root, so this elevates via sudo (prompting once) unless already
+// root. OpenClaw's Node runtime is handled separately via NODE_EXTRA_CA_CERTS.
 func Install(caCertPath string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		return run("security", "add-trusted-cert", "-d", "-r", "trustRoot",
+		return elevate("security", "add-trusted-cert", "-d", "-r", "trustRoot",
 			"-k", "/Library/Keychains/System.keychain", caCertPath)
 	case "linux":
-		data, err := os.ReadFile(caCertPath)
-		if err != nil {
+		if err := elevate("cp", caCertPath, linuxCertPath); err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(linuxCertPath), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(linuxCertPath, data, 0o644); err != nil {
-			return err
-		}
-		return run("update-ca-certificates")
+		return elevate("update-ca-certificates")
 	default:
 		return fmt.Errorf("CA trust install unsupported on %s", runtime.GOOS)
 	}
@@ -39,19 +31,26 @@ func Install(caCertPath string) error {
 func Remove(caCertPath string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		return run("security", "remove-trusted-cert", "-d", caCertPath)
+		return elevate("security", "remove-trusted-cert", "-d", caCertPath)
 	case "linux":
-		_ = os.Remove(linuxCertPath)
-		return run("update-ca-certificates")
+		_ = elevate("rm", "-f", linuxCertPath)
+		return elevate("update-ca-certificates")
 	default:
 		return nil
 	}
 }
 
-func run(bin string, args ...string) error {
-	out, err := exec.Command(bin, args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %v: %s", bin, err, out)
+// elevate runs a command as root, via sudo (with the terminal attached so it
+// can prompt) when we aren't already root.
+func elevate(bin string, args ...string) error {
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 {
+		cmd = exec.Command(bin, args...)
+	} else {
+		cmd = exec.Command("sudo", append([]string{bin}, args...)...)
 	}
-	return nil
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

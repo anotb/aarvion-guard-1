@@ -161,9 +161,11 @@ func cmdInit(args []string) {
 			fatal(err)
 		}
 		caEnv = caCertPath()
+		fmt.Println("trusting the guard CA (may prompt for your password)...")
 		if err := trust.Install(caEnv); err != nil {
 			fmt.Printf("! could not trust the guard CA: %v\n", err)
-			fmt.Println("  HTTPS interception will fail until it's trusted; re-run, or use --no-inspect for host-level only.")
+			fmt.Printf("  run it yourself, then `aarvion-guard run`:\n    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s\n", caEnv)
+			fmt.Println("  or re-init with --no-inspect for host-level governance only.")
 		} else {
 			fmt.Println("installed guard CA into the system trust store")
 		}

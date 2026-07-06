@@ -70,7 +70,7 @@ Authenticode before distribution (env-gated; see `../OPENCLAW_GUARD_B_PLAN.md` Â
 ## Install
 
 ```
-npx @aarvion/guard init <pairing-code>     # from the Aarvion dashboard
+npx @aarvionai/guard init <pairing-code>   # from the Aarvion dashboard
 # or
 curl -fsSL get.aarvion.ai | sh
 ```

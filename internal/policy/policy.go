@@ -36,7 +36,7 @@ func New(opaAddr string) *Client {
 // Eval asks OPA whether an egress request is allowed. The input mirrors the
 // Envoy ext_authz shape the production data plane uses, so the same bundle
 // evaluates unchanged.
-func (c *Client) Eval(ctx context.Context, method, host, path string, headers map[string]string) (*Decision, error) {
+func (c *Client) Eval(ctx context.Context, method, host, path, body string, headers map[string]string) (*Decision, error) {
 	input := map[string]any{
 		"input": map[string]any{
 			"attributes": map[string]any{
@@ -45,18 +45,19 @@ func (c *Client) Eval(ctx context.Context, method, host, path string, headers ma
 						"method":  method,
 						"host":    host,
 						"path":    path,
+						"body":    body,
 						"headers": headers,
 					},
 				},
 			},
 		},
 	}
-	body, err := json.Marshal(input)
+	payload, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+entrypoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+entrypoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}

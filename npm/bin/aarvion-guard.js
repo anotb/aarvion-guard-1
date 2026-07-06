@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict'
 
-// Thin launcher for `npx @aarvion/guard`: downloads the platform binary from
+// Thin launcher for `npx @aarvionai/guard`: downloads the platform binary from
 // GitHub Releases into a cache on first use, then execs it with the given args.
 const fs = require('fs')
 const os = require('os')

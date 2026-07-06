@@ -2,10 +2,13 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
@@ -24,6 +27,9 @@ type Server struct {
 	passthrough map[string]bool
 	inspect     bool
 	transport   *http.Transport
+
+	mu      sync.Mutex
+	learned map[string]bool
 }
 
 func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool) *Server {
@@ -37,7 +43,25 @@ func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recor
 		passthrough: pt,
 		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},
+		learned:     map[string]bool{},
 	}
+}
+
+func (s *Server) shouldSplice(host string) bool {
+	if !s.inspect || s.passthrough[host] {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.learned[host]
+}
+
+// learn records a host whose client rejected the MITM leaf (cert-pinned), so
+// future connections to it pass through instead of failing again.
+func (s *Server) learn(host string) {
+	s.mu.Lock()
+	s.learned[host] = true
+	s.mu.Unlock()
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -69,7 +93,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	if !s.inspect || s.passthrough[host] {
+	if s.shouldSplice(host) {
 		s.splice(w, r, host, hj)
 		return
 	}
@@ -78,7 +102,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	s.deps.ServeTLS(client, r.Host)
+	if err := s.deps.ServeTLS(client, r.Host); err != nil {
+		s.learn(host)
+		fmt.Fprintf(os.Stderr, "[guard] %s rejected inspection (%v); passing it through on retry — add it to passthrough_hosts to silence\n", host, err)
+	}
 }
 
 // splice handles a passthrough (cert-pinned) host: host-level allow/deny, then

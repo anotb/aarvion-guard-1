@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -36,8 +37,11 @@ type Record struct {
 	RowHash        string `json:"row_hash"`
 }
 
-// hashFields matches the data plane's chain ordering so the CP verifier can
-// walk this guard's chain. json.Marshal per value + Python-default spacing.
+// hashFields is the ordered field set hashed into each row's row_hash. The CP's
+// decision-chain verify is linkage-only (each row's prev_hash == the prior row's
+// row_hash per writer), so this just has to be internally consistent - it does
+// NOT need to byte-match the Python DP shipper's row_hash. If the CP ever starts
+// recomputing decision hashes, this must be reconciled with the DP shipper.
 var hashFields = []string{
 	"seq", "timestamp", "direction", "surface", "entity_id", "jsonrpc_method",
 	"method", "path", "host", "decision", "policy_id", "reason",
@@ -74,6 +78,7 @@ type Recorder struct {
 	entityID  string
 	token     string
 	dpID      string
+	statePath string
 
 	mu      sync.Mutex
 	seq     int
@@ -86,16 +91,48 @@ type Recorder struct {
 	total  int
 }
 
-func New(cpURL, tenant, entityID, token, dpID string) *Recorder {
-	return &Recorder{
-		cpURL:    cpURL,
-		tenant:   tenant,
-		entityID: entityID,
-		token:    token,
-		dpID:     dpID,
-		prev:     "0",
-		sampled:  map[string]int{},
+type chainState struct {
+	Seq  int    `json:"seq"`
+	Prev string `json:"prev"`
+}
+
+func New(cpURL, tenant, entityID, token, dpID, statePath string) *Recorder {
+	r := &Recorder{
+		cpURL:     cpURL,
+		tenant:    tenant,
+		entityID:  entityID,
+		token:     token,
+		dpID:      dpID,
+		statePath: statePath,
+		prev:      "0",
+		sampled:   map[string]int{},
 	}
+	// Resume the hash chain from where the CP last acknowledged, so a restart
+	// (same dp_id writer) links to the prior row instead of re-seeding at "0"
+	// and breaking chain verification.
+	if statePath != "" {
+		if b, err := os.ReadFile(statePath); err == nil {
+			var st chainState
+			if json.Unmarshal(b, &st) == nil && st.Prev != "" {
+				r.seq = st.Seq
+				r.prev = st.Prev
+			}
+		}
+	}
+	return r
+}
+
+// saveState persists the cursor after a successful push, so recovery resumes
+// from the last row the CP actually received.
+func (r *Recorder) saveState(seq int, prev string) {
+	if r.statePath == "" {
+		return
+	}
+	b, err := json.Marshal(chainState{Seq: seq, Prev: prev})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(r.statePath, b, 0o600)
 }
 
 // Add records a decision. Denies/redacts are always queued; repeated identical
@@ -207,6 +244,9 @@ func (r *Recorder) flush(ctx context.Context) {
 		return
 	}
 	resp.Body.Close()
+
+	last := batch[len(batch)-1]
+	r.saveState(last.Seq, last.RowHash)
 }
 
 // Stats returns running counters for the heartbeat.

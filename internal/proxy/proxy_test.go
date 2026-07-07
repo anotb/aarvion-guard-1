@@ -59,7 +59,7 @@ func newGuard(t *testing.T, addr string, passthrough []string) (*decisions.Recor
 		t.Fatal(err)
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
-	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp")
+	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
 	srv := New(addr, authority, pol, rec, nil, passthrough, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

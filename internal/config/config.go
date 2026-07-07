@@ -51,6 +51,9 @@ func Path() string { return filepath.Join(Dir(), "guard.json") }
 
 func OPAConfigPath() string { return filepath.Join(Dir(), "opa-config.yaml") }
 
+// ChainPath persists the decision hash-chain cursor so it survives restarts.
+func ChainPath() string { return filepath.Join(Dir(), "chain.json") }
+
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())
 	if err != nil {

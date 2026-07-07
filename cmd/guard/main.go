@@ -61,6 +61,8 @@ func main() {
 		cmdExec(os.Args[2:])
 	case "service":
 		cmdService(os.Args[2:])
+	case "update":
+		cmdUpdate()
 	case "repair":
 		cmdRepair()
 	case "status":
@@ -82,7 +84,8 @@ usage:
   aarvion-guard init <pairing-code> [--api URL] [--device NAME] [--transparent]
   aarvion-guard run                       # start the guard (root for --transparent)
   aarvion-guard exec -- <cmd...>          # run OpenClaw inside the governed group
-  aarvion-guard service install|uninstall # run the guard on boot (root)
+  aarvion-guard service install|uninstall # run the guard as a background service
+  aarvion-guard update                    # swap in a new binary, keep the pairing
   aarvion-guard repair                    # unstick egress after a hard crash
   aarvion-guard status
   aarvion-guard uninstall
@@ -415,6 +418,25 @@ func cmdUninstall() {
 		fatal(err)
 	}
 	fmt.Println("guard uninstalled (entity kept in dashboard; delete it there to fully remove)")
+}
+
+// cmdUpdate swaps in a newer binary without re-pairing. The launcher has already
+// downloaded and is running the new version, so we just re-point the background
+// service at this binary and restart it; the pairing, CA and config on disk are
+// left untouched.
+func cmdUpdate() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "not initialized; run `init <pairing-code>` first")
+		os.Exit(1)
+	}
+	if err := svc.Install(); err != nil {
+		fmt.Printf("! could not restart the background service: %v\n", err)
+		fmt.Printf("  the new binary is in place; run `%s run` to start it in the foreground.\n", guardCmd())
+		os.Exit(1)
+	}
+	fmt.Printf("updated to %s and restarted in the background (entity %s)\n", version, cfg.EntityID)
+	fmt.Println("no re-pairing needed. Restart OpenClaw if it was mid-session.")
 }
 
 // parseInterspersed lets flags appear before or after positional args, so

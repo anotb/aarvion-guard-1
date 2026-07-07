@@ -69,10 +69,10 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 
 // Decide evaluates OPA for one request, applying the fail-closed-with-essential
 // posture when OPA can't be reached.
-func (d Deps) Decide(method, host, path, body string) *policy.Decision {
+func (d Deps) Decide(method, host, path, body string, headers map[string]string) *policy.Decision {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	dec, err := d.Pol.Eval(ctx, method, host, path, body, map[string]string{})
+	dec, err := d.Pol.Eval(ctx, method, host, path, body, headers)
 	if err == nil {
 		return dec
 	}
@@ -94,7 +94,7 @@ func (d Deps) serve(conn net.Conn, scheme string, transport *http.Transport) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		host := StripPort(r.Host)
-		dec := d.Decide(r.Method, host, r.URL.Path, PeekBody(r))
+		dec := d.Decide(r.Method, host, r.URL.Path, PeekBody(r), HeaderMap(r))
 		latency := int(time.Since(start).Milliseconds())
 		if !dec.Allowed {
 			d.Rec.Add(r.Method, host, r.URL.Path, "deny", dec.PolicyID, dec.Reason, "", dec.Enforced, latency)
@@ -127,6 +127,17 @@ func PeekBody(r *http.Request) string {
 	}
 	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), bytes.NewReader(overflow[:n]), r.Body))
 	return ""
+}
+
+// HeaderMap flattens request headers into the lowercased, comma-joined shape the
+// Envoy ext_authz input uses, so the same policy bundle sees the same headers on
+// the guard as on the cloud data plane (needed e.g. for AWS's X-Amz-Target).
+func HeaderMap(r *http.Request) map[string]string {
+	out := make(map[string]string, len(r.Header))
+	for k, v := range r.Header {
+		out[strings.ToLower(k)] = strings.Join(v, ",")
+	}
+	return out
 }
 
 func dialTo(addr string) func(context.Context, string, string) (net.Conn, error) {

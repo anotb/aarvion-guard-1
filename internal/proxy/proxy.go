@@ -30,6 +30,7 @@ type Server struct {
 
 	mu      sync.Mutex
 	learned map[string]bool
+	blocked map[string]bool
 }
 
 func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool) *Server {
@@ -44,6 +45,7 @@ func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recor
 		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},
 		learned:     map[string]bool{},
+		blocked:     map[string]bool{},
 	}
 }
 
@@ -62,6 +64,21 @@ func (s *Server) learn(host string) {
 	s.mu.Lock()
 	s.learned[host] = true
 	s.mu.Unlock()
+}
+
+// block marks a governed host that rejected inspection so future connections
+// fail closed rather than silently downgrading to a host-level tunnel (which
+// would let writes slip past body/path policy).
+func (s *Server) block(host string) {
+	s.mu.Lock()
+	s.blocked[host] = true
+	s.mu.Unlock()
+}
+
+func (s *Server) isBlocked(host string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked[host]
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -88,6 +105,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host := mitm.StripPort(r.Host)
+	if s.isBlocked(host) {
+		http.Error(w, "guard: inspection required for "+host, http.StatusForbidden)
+		return
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
@@ -103,8 +124,17 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err := s.deps.ServeTLS(client, r.Host); err != nil {
-		s.learn(host)
-		fmt.Fprintf(os.Stderr, "[guard] %s rejected inspection (%v); passing it through on retry — add it to passthrough_hosts to silence\n", host, err)
+		// A rejected leaf on an essential (LLM) or explicitly allowlisted host
+		// falls back to a host-level tunnel so the agent keeps working. Any other
+		// host fails closed: silently downgrading a governed host to host-level
+		// would let writes bypass body/path policy.
+		if s.deps.Essential[host] || s.passthrough[host] {
+			s.learn(host)
+			fmt.Fprintf(os.Stderr, "[guard] %s rejected inspection (%v); passing it through (essential/allowlisted)\n", host, err)
+		} else {
+			s.block(host)
+			fmt.Fprintf(os.Stderr, "[guard] %s rejected inspection (%v); BLOCKING — add it to passthrough_hosts to allow uninspected\n", host, err)
+		}
 	}
 }
 
@@ -112,7 +142,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // a raw byte tunnel with no inspection.
 func (s *Server) splice(w http.ResponseWriter, r *http.Request, host string, hj http.Hijacker) {
 	start := time.Now()
-	d := s.deps.Decide(http.MethodConnect, host, "/", "")
+	d := s.deps.Decide(http.MethodConnect, host, "/", "", nil)
 	latency := int(time.Since(start).Milliseconds())
 	if !d.Allowed {
 		s.deps.Rec.Add(http.MethodConnect, host, "/", "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)
@@ -142,7 +172,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	host := mitm.StripPort(r.Host)
-	d := s.deps.Decide(r.Method, host, r.URL.Path, mitm.PeekBody(r))
+	d := s.deps.Decide(r.Method, host, r.URL.Path, mitm.PeekBody(r), mitm.HeaderMap(r))
 	latency := int(time.Since(start).Milliseconds())
 	if !d.Allowed {
 		s.deps.Rec.Add(r.Method, host, r.URL.Path, "deny", d.PolicyID, d.Reason, "", d.Enforced, latency)

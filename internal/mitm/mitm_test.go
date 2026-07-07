@@ -40,3 +40,17 @@ func TestPeekBodyNil(t *testing.T) {
 		t.Fatalf("PeekBody(nil) = %q, want empty", got)
 	}
 }
+
+func TestHeaderMapLowercasesAndJoins(t *testing.T) {
+	r := httptest.NewRequest("POST", "https://api/x", nil)
+	r.Header.Set("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+	r.Header.Add("X-Multi", "a")
+	r.Header.Add("X-Multi", "b")
+	m := HeaderMap(r)
+	if m["x-amz-target"] != "DynamoDB_20120810.DeleteTable" {
+		t.Fatalf("x-amz-target = %q", m["x-amz-target"])
+	}
+	if m["x-multi"] != "a,b" {
+		t.Fatalf("x-multi = %q, want a,b", m["x-multi"])
+	}
+}

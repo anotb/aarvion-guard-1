@@ -235,7 +235,7 @@ func cmdRun() {
 	}
 
 	pol := policy.New(cfg.OPAAddr)
-	rec := decisions.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken, cfg.DPID)
+	rec := decisions.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken, cfg.DPID, config.ChainPath())
 	hb := heartbeat.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken, cfg.DPID, cfg.Mode, rec)
 
 	go rec.RunPush(ctx, 10*time.Second)

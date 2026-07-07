@@ -1,6 +1,6 @@
 {
   "name": "@aarvionai/guard",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Govern your local OpenClaw with Aarvion",
   "bin": {
     "aarvion-guard": "bin/aarvion-guard.js"

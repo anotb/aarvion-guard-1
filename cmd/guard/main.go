@@ -193,14 +193,15 @@ func cmdInit(args []string) {
 		}
 		fmt.Printf("wired OpenClaw egress → guard (%s)\n", envPath)
 	}
-	fmt.Println("next:")
-	fmt.Printf("  1. %s run\n", guardCmd())
-	fmt.Println("     # start the guard + policy engine")
-	if runtime.GOOS == "darwin" {
-		fmt.Println("  2. launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway")
-		fmt.Println("     # restart OpenClaw so it picks up the proxy")
+	if err := svc.Install(); err != nil {
+		fmt.Printf("! could not install the background service: %v\n", err)
+		fmt.Printf("  start it in the foreground instead: %s run\n", guardCmd())
 	} else {
-		fmt.Println("  2. restart OpenClaw so it picks up the proxy")
+		fmt.Println("guard is running in the background (starts at login, restarts on crash)")
+	}
+	fmt.Println("last step - restart OpenClaw so it picks up the proxy:")
+	if runtime.GOOS == "darwin" {
+		fmt.Println("  launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway")
 	}
 }
 
@@ -389,6 +390,7 @@ func cmdUninstall() {
 		fmt.Fprintln(os.Stderr, "nothing to uninstall")
 		return
 	}
+	_ = svc.Uninstall()
 	if cfg.Inspect {
 		if err := trust.Remove(caCertPath()); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not remove guard CA trust: %v\n", err)

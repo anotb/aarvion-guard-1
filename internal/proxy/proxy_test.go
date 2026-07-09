@@ -182,7 +182,7 @@ func TestConnectMitmDeniesInnerHostMismatch(t *testing.T) {
 		t.Fatalf("spoofed inner Host: body %q, want host_mismatch reason", body)
 	}
 	// The recorded deny must be keyed to the trusted authority, never the spoof.
-	if total, denies, _ := rec.Stats(); denies < 1 || total < 1 {
+	if total, denies, _, _ := rec.Stats(); denies < 1 || total < 1 {
 		t.Fatalf("host_mismatch deny not recorded: total=%d denies=%d", total, denies)
 	}
 }
@@ -238,7 +238,7 @@ func TestConnectMitmAllowsMatchingInnerHost(t *testing.T) {
 	if resp.StatusCode == http.StatusForbidden {
 		t.Fatalf("matching inner Host GET was denied 403; want it allowed/forwarded")
 	}
-	if total, denies, _ := rec.Stats(); total < 1 || denies != 0 {
+	if total, denies, _, _ := rec.Stats(); total < 1 || denies != 0 {
 		t.Fatalf("matching request not recorded as allow: total=%d denies=%d", total, denies)
 	}
 }

@@ -256,3 +256,60 @@ func TestOriginTagging(t *testing.T) {
 		t.Fatalf("chain broken across paths: prev=%q want %q", got.PrevHash, r.pending[0].RowHash)
 	}
 }
+
+// captureSink records every row it receives so a test can assert the Recorder
+// fanned the finalized decision out to the injected sink.
+type captureSink struct {
+	rows []Record
+}
+
+func (c *captureSink) Record(rec Record) { c.rows = append(c.rows, rec) }
+
+// The injected sink must be called on both the proxy Add path and the runtime
+// AddGoverned path, and must receive the FINALIZED row (seq + hash-chain
+// linkage stamped), since chain() calls it after finalizing.
+func TestSinkCalledOnBothPaths(t *testing.T) {
+	sink := &captureSink{}
+	r := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "s.json"))
+	r.SetSink(sink)
+
+	r.Add("POST", "api.example.com", "/x", "deny", "pol", "blocked", "", true, 1)
+	r.AddGoverned(Record{
+		Timestamp:         "2026-07-09T00:00:00Z",
+		Method:            "GET",
+		Host:              "api.example.com",
+		Path:              "/y",
+		Decision:          "allow",
+		Surface:           "egress",
+		CallerPrincipalID: "p1",
+	})
+
+	if len(sink.rows) != 2 {
+		t.Fatalf("sink not called on both paths: got %d rows want 2", len(sink.rows))
+	}
+	// Rows arrive finalized: seq assigned and row_hash set, matching what was
+	// queued for the CP push.
+	for i, got := range sink.rows {
+		if got.Seq != i+1 {
+			t.Fatalf("row %d not finalized: seq=%d want %d", i, got.Seq, i+1)
+		}
+		if got.RowHash == "" || got.RowHash != r.pending[i].RowHash {
+			t.Fatalf("sink row %d != queued row: sink=%q queued=%q", i, got.RowHash, r.pending[i].RowHash)
+		}
+	}
+	if sink.rows[0].Origin != OriginProxy || sink.rows[1].Origin != OriginRuntime {
+		t.Fatalf("sink lost origin tagging: %q, %q", sink.rows[0].Origin, sink.rows[1].Origin)
+	}
+}
+
+// A nil sink (the default: no observability configured) must be safe - the
+// decision path just skips the hook.
+func TestNilSinkIsSafe(t *testing.T) {
+	r := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "n.json"))
+	// No SetSink call, so r.sink is nil.
+	r.Add("POST", "api.example.com", "/x", "deny", "pol", "r", "", true, 1)
+	r.AddGoverned(Record{Timestamp: "2026-07-09T00:00:00Z", Method: "GET", Host: "h", Path: "/y", Decision: "allow", Surface: "egress"})
+	if len(r.pending) != 2 {
+		t.Fatalf("nil sink broke the decision path: pending=%d want 2", len(r.pending))
+	}
+}

@@ -95,6 +95,17 @@ func rowHash(fields map[string]any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Sink is an optional side-channel that observes every finalized decision row
+// (the same rows queued for the CP push). Implementations live in
+// internal/sinks and are injected via SetSink; this package stays free of
+// net/http and file specifics so there is no import cycle - sinks imports
+// decisions for the Record type, decisions never imports sinks. Record is called
+// on the decision path while the Recorder lock is held, so implementations MUST
+// NOT block (buffer + hand off to a goroutine).
+type Sink interface {
+	Record(Record)
+}
+
 // Recorder accumulates decisions, collapses repeated identical allows, and
 // pushes batches to the CP.
 type Recorder struct {
@@ -110,11 +121,21 @@ type Recorder struct {
 	prev    string
 	pending []Record
 	sampled map[string]int
+	sink    Sink
 
 	denies  int
 	errors  int
 	total   int
 	dropped int
+}
+
+// SetSink attaches an optional observability sink. A nil sink (the default) is
+// safe: the sink hook in chain() is skipped entirely. Set once at startup,
+// before any decisions flow.
+func (r *Recorder) SetSink(s Sink) {
+	r.mu.Lock()
+	r.sink = s
+	r.mu.Unlock()
 }
 
 type chainState struct {
@@ -258,6 +279,14 @@ func (r *Recorder) chain(rec Record) {
 	})
 	r.prev = rec.RowHash
 	r.pending = append(r.pending, rec)
+
+	// Fan the finalized row out to the optional observability sink (JSONL,
+	// metrics, deny webhook). This runs on the decision path under the lock, so
+	// the sink contract is non-blocking: it must buffer and hand off. A nil sink
+	// (no observability configured) skips this entirely.
+	if r.sink != nil {
+		r.sink.Record(rec)
+	}
 }
 
 func nullable(s string) any {

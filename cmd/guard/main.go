@@ -28,6 +28,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/pair"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/proxy"
+	"github.com/aarvion-ai/aarvion-guard/internal/sinks"
 	"github.com/aarvion-ai/aarvion-guard/internal/svc"
 	"github.com/aarvion-ai/aarvion-guard/internal/tproxy"
 	"github.com/aarvion-ai/aarvion-guard/internal/trust"
@@ -261,6 +262,12 @@ func cmdRun() {
 	rec := decisions.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken, cfg.DPID, config.ChainPath())
 	hb := heartbeat.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken, cfg.DPID, cfg.Mode, rec)
 
+	// Observability sinks run ALONGSIDE the CP push, fed from the same decision
+	// stream, so they work in every inspect mode. Each is optional (started only
+	// when its config field is set); closeSinks flushes them on shutdown.
+	closeSinks := attachSinks(ctx, cfg, rec)
+	defer closeSinks()
+
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
@@ -332,6 +339,58 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)
 	}
+}
+
+// attachSinks builds the configured observability sinks, wires them into the
+// Recorder as a single fanout, and starts the metrics server (sharing ctx for
+// shutdown). It returns a cleanup func that flushes/closes the buffered sinks -
+// call it on shutdown so the JSONL audit copy and any queued deny webhooks
+// drain. Each output is independent and optional; a config with none set leaves
+// the Recorder's sink nil (the no-op fast path).
+func attachSinks(ctx context.Context, cfg *config.Config, rec *decisions.Recorder) func() {
+	var closers []func()
+	cleanup := func() {
+		for _, c := range closers {
+			c()
+		}
+	}
+
+	obs := cfg.Observability
+	var members []decisions.Sink
+
+	if obs.AuditJSONLPath != "" {
+		js, err := sinks.NewJSONL(obs.AuditJSONLPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[sinks] audit jsonl disabled: %v\n", err)
+		} else {
+			members = append(members, js)
+			closers = append(closers, func() { _ = js.Close() })
+			fmt.Printf("audit sink writing decisions to %s\n", obs.AuditJSONLPath)
+		}
+	}
+
+	if obs.DenyWebhookURL != "" {
+		wh := sinks.NewWebhook(obs.DenyWebhookURL)
+		members = append(members, wh)
+		closers = append(closers, wh.Close)
+		fmt.Printf("deny webhook posting to %s\n", obs.DenyWebhookURL)
+	}
+
+	if m := sinks.NewMulti(members...); m.Len() > 0 {
+		rec.SetSink(m)
+	}
+
+	if obs.MetricsAddr != "" {
+		ms := sinks.NewMetrics(obs.MetricsAddr, rec)
+		go func() {
+			if err := ms.Serve(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "[metrics] %v\n", err)
+			}
+		}()
+		fmt.Printf("metrics endpoint on http://%s/metrics\n", obs.MetricsAddr)
+	}
+
+	return cleanup
 }
 
 func cmdExec(args []string) {

@@ -29,7 +29,20 @@ type Config struct {
 	EssentialHosts   []string `json:"essential_hosts,omitempty"`
 	Inspect          bool     `json:"inspect"`
 
-	Govern Govern `json:"govern,omitempty"`
+	Govern        Govern        `json:"govern,omitempty"`
+	Observability Observability `json:"observability,omitempty"`
+}
+
+// Observability configures pluggable, config-driven outputs that run ALONGSIDE
+// the CP push, fed from the same decision stream. Each output is optional and
+// only starts when its field is set:
+//   - AuditJSONLPath: on-box append-only JSONL forensic copy of every decision.
+//   - MetricsAddr: addr for a tiny Prometheus /metrics HTTP endpoint.
+//   - DenyWebhookURL: URL to POST a small JSON payload to on each deny.
+type Observability struct {
+	AuditJSONLPath string `json:"audit_jsonl_path,omitempty"`
+	MetricsAddr    string `json:"metrics_addr,omitempty"`
+	DenyWebhookURL string `json:"deny_webhook_url,omitempty"`
 }
 
 // Govern configures the local Policy Decision Point: a Unix-socket server the

@@ -171,6 +171,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
+	// Cleartext forward proxy: r.Host is both the dial target and the policy key,
+	// so they can't diverge here — no separate trusted authority to reconcile
+	// against (unlike the MITM path, where the CONNECT target is the authority
+	// and the inner Host is spoofable).
 	host := mitm.StripPort(r.Host)
 	d := s.deps.Decide(r.Method, host, r.URL.Path, mitm.PeekBody(r), mitm.HeaderMap(r))
 	latency := int(time.Since(start).Milliseconds())

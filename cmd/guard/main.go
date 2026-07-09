@@ -43,9 +43,30 @@ const (
 	defaultOPAAddr   = "127.0.0.1:8181"
 )
 
-// essentialHosts stay reachable when OPA is down (fail-closed-with-essential),
-// so a policy-engine hiccup degrades the assistant instead of killing it.
-var essentialHosts = []string{"api.anthropic.com", "api.openai.com"}
+// defaultEssentialHosts stay reachable when OPA is down (fail-closed-with-
+// essential), so a policy-engine hiccup degrades the assistant instead of
+// killing its brain. It covers the direct model endpoints (including
+// chatgpt.com, which a real OpenClaw drives over OAuth) plus the common
+// provider suffixes, where an entry beginning with "." matches by host suffix.
+// Override per-install via config's essential_hosts.
+var defaultEssentialHosts = []string{
+	"api.anthropic.com",
+	"api.openai.com",
+	"chatgpt.com",
+	"generativelanguage.googleapis.com",
+	".openai.azure.com",
+	".bedrock-runtime.amazonaws.com",
+	".aiplatform.googleapis.com",
+}
+
+// essentialHosts returns the effective essential list: the config override when
+// set, else the built-in defaults.
+func essentialHosts(cfg *config.Config) []string {
+	if len(cfg.EssentialHosts) > 0 {
+		return cfg.EssentialHosts
+	}
+	return defaultEssentialHosts
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -252,7 +273,7 @@ func cmdRun() {
 			}
 			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts, cfg.PassthroughHosts, cfg.Inspect)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect)
 		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
@@ -285,7 +306,7 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	// OpenClaw's egress black-holed.
 	defer func() { _ = backend.Remove() }()
 
-	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts, intercept.OriginalDst)
+	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst)
 	fmt.Printf("guard intercepting on %s (mode=transparent, group=%s, entity=%s)\n", cfg.TransparentAddr, cfg.GuardGroup, cfg.EntityID)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)

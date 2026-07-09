@@ -18,6 +18,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
 
 // fakeOPA denies write methods, allows the rest — the shape the real bundle uses.
@@ -60,12 +61,115 @@ func newGuard(t *testing.T, addr string, passthrough []string) (*decisions.Recor
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, passthrough, true)
+	srv := New(addr, authority, pol, rec, nil, passthrough, true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
 	waitListening(t, addr)
 	return rec, authority
+}
+
+// newRateLimitedGuard starts a forward proxy whose OPA allows every request, so
+// any deny observed comes purely from the injected rate limiter. Used to prove
+// the ceiling denies over-limit egress while under-limit egress is governed
+// normally, end-to-end through the real proxy handler.
+func newRateLimitedGuard(t *testing.T, addr string, limiter *ratelimit.Limiter) *decisions.Recorder {
+	t.Helper()
+	opa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{"allowed": true}})
+	}))
+	t.Cleanup(opa.Close)
+	dir := t.TempDir()
+	authority, err := ca.EnsureCA(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
+	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
+	srv := New(addr, authority, pol, rec, nil, nil, true, limiter)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.ListenAndServe(ctx) }()
+	waitListening(t, addr)
+	return rec
+}
+
+// A host over its per-window ceiling gets a rate_limited 429 deny through the
+// real forward-proxy handler, while a distinct under-limit host is governed
+// normally (allowed → forwarded). The deny is recorded so it flows to the CP
+// push and observability sinks.
+func TestForwardHttpRateLimited(t *testing.T) {
+	addr := "127.0.0.1:18906"
+	// Ceiling of 1/min so the second request to the same host is over the limit.
+	rec := newRateLimitedGuard(t, addr, ratelimit.New(1, time.Minute, nil))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "upstream-ok")
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse("http://" + addr)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	// First GET to the upstream host: under the ceiling, allowed, forwarded.
+	resp1, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if resp1.StatusCode != 200 || string(body1) != "upstream-ok" {
+		t.Fatalf("first (under-limit) request: got %d %q, want 200 upstream-ok", resp1.StatusCode, body1)
+	}
+
+	// Second GET to the same host: over the ceiling → 429 rate_limited.
+	resp2, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second (over-limit) request: got %d %q, want 429", resp2.StatusCode, body2)
+	}
+	if !strings.Contains(string(body2), "rate_limited") {
+		t.Fatalf("over-limit body = %q, want rate_limited", body2)
+	}
+	if _, denies, _, _ := rec.Stats(); denies < 1 {
+		t.Fatalf("rate-limited deny not recorded: denies=%d", denies)
+	}
+}
+
+// With a nil limiter the proxy behaves exactly as before: repeated allowed
+// requests to the same host are all forwarded, never rate-limited.
+func TestForwardHttpNilLimiterUnchanged(t *testing.T) {
+	addr := "127.0.0.1:18907"
+	rec := newRateLimitedGuard(t, addr, nil)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse("http://" + addr)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	for i := 0; i < 5; i++ {
+		resp, err := client.Get(upstream.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("nil limiter must never rate-limit (request %d got 429)", i+1)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: got %d, want 200", i+1, resp.StatusCode)
+		}
+	}
+	if _, denies, _, _ := rec.Stats(); denies != 0 {
+		t.Fatalf("nil limiter produced %d denies, want 0", denies)
+	}
 }
 
 // The money shot: a write over HTTPS through a CONNECT tunnel is MITM'd, its

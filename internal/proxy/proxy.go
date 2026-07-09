@@ -15,6 +15,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
 
 // Server is the forward proxy: OpenClaw points HTTP(S)_PROXY at it. HTTPS is
@@ -33,14 +34,14 @@ type Server struct {
 	blocked map[string]bool
 }
 
-func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool) *Server {
+func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool, limiter *ratelimit.Limiter) *Server {
 	pt := map[string]bool{}
 	for _, h := range passthrough {
 		pt[strings.ToLower(h)] = true
 	}
 	return &Server{
 		addr:        addr,
-		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential)},
+		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter},
 		passthrough: pt,
 		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},

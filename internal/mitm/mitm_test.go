@@ -13,6 +13,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
 
 func TestPeekBodyReturnsFullBodyAndRestores(t *testing.T) {
@@ -150,6 +151,131 @@ func TestServePlainIPAuthorityGovernsInnerHost(t *testing.T) {
 	// Governed + allowed → upstream dial to 127.0.0.1:1 is refused → 502.
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("got %d %q; want 502 (governed on inner Host, upstream dial fails)", resp.StatusCode, body)
+	}
+}
+
+// allowAllOPA is an OPA stub that allows every request, so a deny in these tests
+// can only come from the in-guard rate limiter, never from policy.
+func allowAllOPA(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{"allowed": true}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A host over its rate ceiling is short-circuited to a rate_limited 429 deny
+// BEFORE OPA runs, while an under-limit host is governed normally (allowed here,
+// since OPA allows everything). This is the runaway guardrail on the decision
+// path, keyed on host so it works in every inspect mode.
+func TestDecideRateLimitedOverCeiling(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{
+		Pol:     policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:     decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Limiter: ratelimit.New(2, time.Minute, nil),
+	}
+
+	// First two to the runaway host are under the ceiling → allowed by OPA.
+	for i := 0; i < 2; i++ {
+		dec := d.Decide("GET", "runaway.example", "/", "", nil)
+		if !dec.Allowed {
+			t.Fatalf("request %d to runaway.example should be allowed (under ceiling): %+v", i+1, dec)
+		}
+	}
+	// Third crosses the ceiling → rate_limited 429 deny, short-circuiting OPA.
+	dec := d.Decide("GET", "runaway.example", "/", "", nil)
+	if dec.Allowed {
+		t.Fatal("over-ceiling request should be denied")
+	}
+	if dec.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("over-ceiling status = %d, want 429", dec.HTTPStatus)
+	}
+	if dec.Reason != "rate_limited" || dec.PolicyID != "guard" || !dec.Enforced {
+		t.Fatalf("over-ceiling decision = %+v, want reason=rate_limited policy_id=guard enforced=true", dec)
+	}
+
+	// A different, under-limit host is unaffected — governed normally.
+	if dec := d.Decide("GET", "calm.example", "/", "", nil); !dec.Allowed {
+		t.Fatalf("under-limit host should be governed normally (allowed): %+v", dec)
+	}
+}
+
+// A nil limiter must not change the decision path at all: every request is
+// governed by OPA exactly as before the feature.
+func TestDecideNilLimiterUnchanged(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{
+		Pol:     policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:     decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Limiter: nil,
+	}
+	// Far more requests than any small ceiling — with no limiter, all are allowed.
+	for i := 0; i < 25; i++ {
+		dec := d.Decide("GET", "any.example", "/", "", nil)
+		if !dec.Allowed {
+			t.Fatalf("nil limiter must leave OPA-allowed request allowed (req %d): %+v", i+1, dec)
+		}
+		if dec.Reason == "rate_limited" {
+			t.Fatal("nil limiter must never produce a rate_limited decision")
+		}
+	}
+}
+
+// End-to-end over ServePlain: a rate-limited request must surface as a 429 to
+// the client and be recorded as a deny with reason rate_limited (which is what
+// flows to the CP push / observability sinks / denies_total).
+func TestServePlainRateLimitedRecordsDeny(t *testing.T) {
+	opa := allowAllOPA(t)
+	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
+	d := Deps{
+		Pol:     policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:     rec,
+		Limiter: ratelimit.New(1, time.Minute, nil),
+	}
+
+	// The limiter keys on the governed host; a hostname dial authority binds it,
+	// so both requests here hit the same "example.com" key.
+	do := func() *http.Response {
+		client, server := net.Pipe()
+		defer client.Close()
+		go d.ServePlain(server, "example.com:80")
+		_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		return resp
+	}
+
+	// First request is under the ceiling → allowed, then the upstream dial to a
+	// real example.com is what determines the final status; either way it is not
+	// a 429 rate-limit.
+	resp1 := do()
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if resp1.StatusCode == http.StatusTooManyRequests {
+		t.Fatalf("first (under-limit) request wrongly rate-limited: %q", body1)
+	}
+
+	// Second request crosses the ceiling → 429 with the rate_limited reason.
+	resp2 := do()
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second (over-limit) request: got %d %q, want 429", resp2.StatusCode, body2)
+	}
+	if !strings.Contains(string(body2), "rate_limited") {
+		t.Fatalf("over-limit body = %q, want rate_limited reason", body2)
+	}
+
+	// The over-limit request must be recorded as a deny (feeds denies_total etc.).
+	if _, denies, _, _ := rec.Stats(); denies < 1 {
+		t.Fatalf("rate-limited deny not recorded: denies=%d", denies)
 	}
 }
 

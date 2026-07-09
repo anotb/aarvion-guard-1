@@ -28,6 +28,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/pair"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/proxy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 	"github.com/aarvion-ai/aarvion-guard/internal/sinks"
 	"github.com/aarvion-ai/aarvion-guard/internal/svc"
 	"github.com/aarvion-ai/aarvion-guard/internal/tproxy"
@@ -69,6 +70,17 @@ func essentialHosts(cfg *config.Config) []string {
 		return cfg.EssentialHosts
 	}
 	return defaultEssentialHosts
+}
+
+// buildLimiter constructs the egress rate limiter from config, or nil when it's
+// disabled. A nil limiter is threaded into the proxy/tproxy Deps unchanged, so
+// "rate_limit off" is exactly the pre-feature behavior with zero overhead.
+func buildLimiter(cfg *config.Config) *ratelimit.Limiter {
+	rl := cfg.RateLimit
+	if !rl.Enabled {
+		return nil
+	}
+	return ratelimit.New(rl.PerMinute, time.Minute, rl.PerHost)
 }
 
 func main() {
@@ -268,6 +280,13 @@ func cmdRun() {
 	closeSinks := attachSinks(ctx, cfg, rec)
 	defer closeSinks()
 
+	// Optional egress rate limiter: an in-memory, per-host ceiling checked before
+	// OPA. nil when rate_limit is disabled, which preserves the prior behavior.
+	limiter := buildLimiter(cfg)
+	if limiter != nil {
+		fmt.Printf("egress rate limit active (%d/min per host, %d host overrides)\n", cfg.RateLimit.PerMinute, len(cfg.RateLimit.PerHost))
+	}
+
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
@@ -291,7 +310,7 @@ func cmdRun() {
 	}
 
 	if cfg.Mode == config.ModeTransparent {
-		runTransparent(ctx, cfg, pol, rec)
+		runTransparent(ctx, cfg, pol, rec, limiter)
 	} else {
 		var authority *ca.CA
 		if cfg.Inspect {
@@ -301,7 +320,7 @@ func cmdRun() {
 			}
 			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter)
 		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
@@ -310,7 +329,7 @@ func cmdRun() {
 	fmt.Println("guard stopped")
 }
 
-func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder) {
+func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter) {
 	gid, err := ensureGroup(cfg.GuardGroup)
 	if err != nil {
 		fatal(fmt.Errorf("group %q: %w (run with sudo)", cfg.GuardGroup, err))
@@ -334,7 +353,7 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	// OpenClaw's egress black-holed.
 	defer func() { _ = backend.Remove() }()
 
-	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst)
+	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter)
 	fmt.Printf("guard intercepting on %s (mode=transparent, group=%s, entity=%s)\n", cfg.TransparentAddr, cfg.GuardGroup, cfg.EntityID)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)

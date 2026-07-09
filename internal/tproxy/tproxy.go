@@ -9,6 +9,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
 
 // Server is the transparent interception front end. The kernel redirects the
@@ -20,10 +21,10 @@ type Server struct {
 	origDst func(net.Conn) (netip.AddrPort, error)
 }
 
-func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error)) *Server {
+func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error), limiter *ratelimit.Limiter) *Server {
 	return &Server{
 		addr:    addr,
-		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential)},
+		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter},
 		origDst: origDst,
 	}
 }

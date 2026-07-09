@@ -14,6 +14,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
+	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
 
 // maxBodyPeek bounds how much of a request body is buffered for policy
@@ -31,6 +32,11 @@ type Deps struct {
 	Pol       *policy.Client
 	Rec       *decisions.Recorder
 	Essential EssentialSet
+
+	// Limiter is an optional in-memory, per-host egress rate ceiling checked
+	// BEFORE OPA (see Decide). A nil Limiter disables rate limiting entirely and
+	// preserves the pre-feature behavior exactly.
+	Limiter *ratelimit.Limiter
 }
 
 // EssentialSet matches hosts that stay reachable when OPA is down. A plain
@@ -155,7 +161,17 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 
 // Decide evaluates OPA for one request, applying the fail-closed-with-essential
 // posture when OPA can't be reached.
+//
+// The rate-limit ceiling is checked FIRST, before any OPA call: if a limiter is
+// configured and this host is over its per-window ceiling, the request is
+// short-circuited to a deny (429, reason "rate_limited"). This runs entirely in
+// memory, so a runaway loop is cut off cheaply without loading OPA, and — because
+// it keys on host — it works in no-inspect mode too. A nil limiter skips this
+// block entirely, preserving the exact prior behavior.
 func (d Deps) Decide(method, host, path, body string, headers map[string]string) *policy.Decision {
+	if d.Limiter != nil && !d.Limiter.Allow(host, time.Now()) {
+		return &policy.Decision{Allowed: false, HTTPStatus: http.StatusTooManyRequests, PolicyID: "guard", Reason: "rate_limited", Enforced: true}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dec, err := d.Pol.Eval(ctx, method, host, path, body, headers)

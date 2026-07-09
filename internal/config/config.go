@@ -31,6 +31,23 @@ type Config struct {
 
 	Govern        Govern        `json:"govern,omitempty"`
 	Observability Observability `json:"observability,omitempty"`
+	RateLimit     RateLimit     `json:"rate_limit,omitempty"`
+}
+
+// RateLimit configures the in-guard, per-destination-host egress rate ceiling
+// evaluated in memory before OPA. It's a runaway guardrail: a looping agent
+// hammering one host is denied once it crosses the ceiling, rather than running
+// up a bill or earning a rate-ban. It keys on host, so it works host-level and
+// thus in no-inspect mode too. When Enabled is false (or the struct is absent)
+// no limiter is built and there is zero overhead.
+//
+//   - PerMinute: default per-host ceiling per 60s window.
+//   - PerHost:   overrides PerMinute for named hosts (0 disables the limit for
+//     that host).
+type RateLimit struct {
+	Enabled   bool           `json:"enabled"`
+	PerMinute int            `json:"per_minute,omitempty"`
+	PerHost   map[string]int `json:"per_host,omitempty"`
 }
 
 // Observability configures pluggable, config-driven outputs that run ALONGSIDE

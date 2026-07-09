@@ -1,6 +1,7 @@
 package opa
 
 import (
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -37,8 +38,9 @@ func TestPinMapHasEntryPerPlatform(t *testing.T) {
 			t.Errorf("opaSHA256 missing pin for %s", platform)
 			continue
 		}
-		if len(pin) != 64 {
-			t.Errorf("opaSHA256[%s] = %q, want 64 hex chars", platform, pin)
+		raw, err := hex.DecodeString(pin)
+		if err != nil || len(raw) != 32 {
+			t.Errorf("opaSHA256[%s] = %q, want a 64-char hex (32-byte) sha256", platform, pin)
 		}
 	}
 	if len(opaSHA256) != len(opaAssets) {

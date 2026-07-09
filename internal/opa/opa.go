@@ -72,12 +72,23 @@ func RenderConfig(c *config.Config) error {
 	return os.WriteFile(config.OPAConfigPath(), []byte(body), 0o600)
 }
 
-// Binary resolves the opa executable: the guard-managed pinned copy under
-// ~/.aarvion/bin takes precedence, else whatever is on PATH.
+// Binary resolves the opa executable that will actually be exec'd as the policy
+// engine: the guard-managed copy under ~/.aarvion/bin takes precedence, but only
+// when it still matches the pinned sha256 — an unverified or tampered managed
+// file must never be run as the engine that decides all egress. A pin mismatch
+// falls through to a PATH opa. On a platform with no baked pin (unsupported /
+// manual install) the managed copy is trusted as-is, preserving prior behavior.
 func Binary() (string, error) {
 	local := localBinPath()
 	if _, err := os.Stat(local); err == nil {
-		return local, nil
+		want, err := wantSHA(platformKey())
+		if err != nil {
+			return local, nil // no pin for this platform: trust the manual copy
+		}
+		if sum, ferr := fileSHA256(local); ferr == nil && verifySHA(sum, want) == nil {
+			return local, nil
+		}
+		// Present but pin-mismatched: do not exec it; fall through to PATH.
 	}
 	return exec.LookPath("opa")
 }

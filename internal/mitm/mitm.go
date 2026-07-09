@@ -80,11 +80,13 @@ func (s EssentialSet) Has(host string) bool {
 // non-nil return means the client rejected the MITM leaf (e.g. a cert-pinned
 // client) — the caller can then fall back to passthrough.
 //
-// The policy host is bound to the trusted authority (the host of dialAddr, which
-// comes from the CONNECT target or SO_ORIGINAL_DST — neither of which the agent
-// can forge), NOT the inner request's Host header. If the TLS SNI is present it
-// must match too: a client that resolved a different name than it CONNECTed to
-// is refused so the audit log can't be split from the real destination.
+// The policy host is bound to a trusted destination, never the agent-controlled
+// inner Host header. When dialAddr is a hostname (a forward-proxy CONNECT
+// target) that name is authoritative and a disagreeing SNI is refused. When
+// dialAddr is an IP literal (transparent original-dst, or a CONNECT to a bare
+// IP) the SNI is the name the client intends: we govern on it, and upstream TLS
+// verifies the origin cert against that same name, so a spoofed SNI aimed at a
+// mismatched IP fails the handshake rather than earning a wrong-destination allow.
 func (d Deps) ServeTLS(client net.Conn, dialAddr string) error {
 	tlsConn := tls.Server(client, &tls.Config{
 		GetCertificate: d.CA.GetCertificate,
@@ -95,25 +97,60 @@ func (d Deps) ServeTLS(client net.Conn, dialAddr string) error {
 		return err
 	}
 	authority := StripPort(dialAddr)
-	if sni := tlsConn.ConnectionState().ServerName; sni != "" && !strings.EqualFold(sni, authority) {
-		// SNI disagreeing with the CONNECT/original-dst authority means the client
-		// is trying to reach a name other than the one we're governing on. Refuse.
+	sni := tlsConn.ConnectionState().ServerName
+	governHost, denyMismatch, refuse := bindTLSHost(authority, sni)
+	if refuse {
+		// The client CONNECTed a hostname but asked (via SNI) for a different
+		// one — governing would split the audit trail from the real destination.
+		// Record it rather than dropping the connection silently.
+		d.Rec.Add(http.MethodConnect, authority, "/", "deny", "guard", "sni_mismatch", "", true, 0)
 		tlsConn.Close()
 		return nil
 	}
 	transport := &http.Transport{
 		DialContext:     dialTo(dialAddr),
-		TLSClientConfig: &tls.Config{ServerName: tlsConn.ConnectionState().ServerName},
+		TLSClientConfig: &tls.Config{ServerName: sni},
 	}
-	d.serve(tlsConn, "https", authority, transport)
+	d.serve(tlsConn, "https", governHost, denyMismatch, transport)
 	return nil
 }
 
-// ServePlain governs cleartext HTTP arriving on a raw connection. The policy
-// host is bound to the trusted authority (host of dialAddr), not the inner
-// request's Host header.
+// bindTLSHost derives the host to govern on from the trusted dial authority and
+// the client-presented SNI. It returns that host, whether an inner-Host mismatch
+// should be refused, and whether the whole connection must be refused (a
+// hostname authority with a disagreeing SNI).
+func bindTLSHost(authority, sni string) (governHost string, denyMismatch, refuse bool) {
+	if net.ParseIP(authority) == nil {
+		// Dialed by name: the authority is the trusted destination; a present SNI
+		// must agree with it, and the inner Host must too.
+		if sni != "" && !strings.EqualFold(sni, authority) {
+			return "", false, true
+		}
+		return authority, true, false
+	}
+	// Dialed by IP (transparent original-dst / CONNECT to a literal IP): the SNI
+	// names the destination. Govern on it (upstream cert verification backstops
+	// an SNI/IP mismatch). SNI-less TLS falls back to the IP with no inner-Host
+	// check, since there is no name to reconcile against.
+	if sni != "" {
+		return sni, true, false
+	}
+	return authority, false, false
+}
+
+// ServePlain governs cleartext HTTP arriving on a raw connection. When dialAddr
+// is a hostname the policy host is bound to it (inner-Host mismatch refused);
+// when it is an IP literal (transparent original-dst) there is no trusted name
+// to bind to, so we govern on the request's own Host header (best effort — a
+// cleartext transparent flow has no cert to reconcile the name against).
 func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
-	d.serve(conn, "http", StripPort(dialAddr), &http.Transport{DialContext: dialTo(dialAddr)})
+	authority := StripPort(dialAddr)
+	transport := &http.Transport{DialContext: dialTo(dialAddr)}
+	if net.ParseIP(authority) == nil {
+		d.serve(conn, "http", authority, true, transport)
+		return
+	}
+	d.serve(conn, "http", "", false, transport)
 }
 
 // Decide evaluates OPA for one request, applying the fail-closed-with-essential
@@ -131,12 +168,14 @@ func (d Deps) Decide(method, host, path, body string, headers map[string]string)
 	return &policy.Decision{Allowed: false, HTTPStatus: http.StatusServiceUnavailable, PolicyID: "guard", Reason: "policy_unavailable", Enforced: true}
 }
 
-// serve governs every request on conn against authority, the TRUSTED
-// destination host (from the CONNECT target or SO_ORIGINAL_DST). The inner
-// request's Host header is agent-controlled and MUST NOT key the policy: an
-// agent can CONNECT one host and send an inner Host for another to falsify the
-// audit log. Requests whose inner Host disagrees with authority are denied.
-func (d Deps) serve(conn net.Conn, scheme, authority string, transport *http.Transport) {
+// serve governs every request on conn. governHost is the trusted destination
+// host to key policy and audit on (from a hostname CONNECT target or a validated
+// SNI); when denyMismatch is set, a request whose agent-controlled inner Host
+// disagrees is refused rather than evaluated, so a spoofed Host can't earn an
+// allow to the wrong place or split the audit trail. governHost may be "" only
+// when there is no trusted name to bind to (cleartext transparent flow to a bare
+// IP), in which case we fall back to the request's own Host header.
+func (d Deps) serve(conn net.Conn, scheme, governHost string, denyMismatch bool, transport *http.Transport) {
 	proxy := &httputil.ReverseProxy{
 		Director:      func(*http.Request) {},
 		Transport:     transport,
@@ -147,12 +186,10 @@ func (d Deps) serve(conn net.Conn, scheme, authority string, transport *http.Tra
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		// Govern and record against the trusted authority, never the inner Host.
-		host := authority
-		if inner := StripPort(r.Host); !strings.EqualFold(inner, authority) {
-			// Inner Host doesn't match where the tunnel actually goes: refuse
-			// rather than evaluate, so a spoofed Host can't earn an allow to the
-			// wrong place or split the audit trail from the real destination.
+		host := governHost
+		if host == "" {
+			host = StripPort(r.Host)
+		} else if denyMismatch && !strings.EqualFold(StripPort(r.Host), host) {
 			latency := int(time.Since(start).Milliseconds())
 			d.Rec.Add(r.Method, host, r.URL.Path, "deny", "guard", "host_mismatch", "", true, latency)
 			http.Error(w, "host_mismatch", http.StatusForbidden)

@@ -116,6 +116,34 @@ func TestFlushSuccessAdvancesCursor(t *testing.T) {
 	}
 }
 
+// A 2xx that isn't 200 (e.g. 204 No Content) must count as success — proving the
+// push check is a 2xx-range test, not an == 200 test that would wrongly re-queue
+// and stall the chain on a perfectly-accepted push.
+func TestFlush2xxNon200IsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent) // 204
+	}))
+	defer srv.Close()
+
+	p := filepath.Join(t.TempDir(), "chain.json")
+	r := New(srv.URL, "t", "e", "tok", "dp", p)
+	r.Add("POST", "api.github.com", "/x", "deny", "pol", "r", "", true, 1)
+	last := r.pending[len(r.pending)-1]
+
+	r.flush(context.Background())
+
+	st, ok := readCursor(t, p)
+	if !ok {
+		t.Fatal("204 must be treated as success and persist the cursor")
+	}
+	if st.Seq != last.Seq || st.Prev != last.RowHash {
+		t.Fatalf("cursor wrong on 204: got seq=%d prev=%q want seq=%d prev=%q", st.Seq, st.Prev, last.Seq, last.RowHash)
+	}
+	if _, _, errs, _ := r.Stats(); errs != 0 {
+		t.Fatalf("204 bumped the error counter (%d); it must be a success", errs)
+	}
+}
+
 // At the backlog cap, further Adds must be dropped (incrementing the dropped
 // counter) without growing pending or advancing the chain, and the rows already
 // queued must keep contiguous prev/row linkage.

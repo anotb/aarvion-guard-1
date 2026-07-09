@@ -118,7 +118,7 @@ func TestConnectMitmDeniesHttpsWrite(t *testing.T) {
 		t.Fatalf("DELETE over MITM'd HTTPS: got %d, want 403", resp.StatusCode)
 	}
 
-	total, denies, _ := rec.Stats()
+	total, denies, _, _ := rec.Stats()
 	if denies < 1 || total < 1 {
 		t.Fatalf("deny not recorded: total=%d denies=%d", total, denies)
 	}
@@ -153,7 +153,7 @@ func TestForwardHttpGoverns(t *testing.T) {
 	if resp2.StatusCode != 403 {
 		t.Fatalf("denied POST: got %d, want 403", resp2.StatusCode)
 	}
-	if total, denies, _ := rec.Stats(); total < 2 || denies < 1 {
+	if total, denies, _, _ := rec.Stats(); total < 2 || denies < 1 {
 		t.Fatalf("decisions not recorded: total=%d denies=%d", total, denies)
 	}
 }

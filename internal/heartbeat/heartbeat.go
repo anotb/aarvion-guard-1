@@ -11,7 +11,7 @@ import (
 
 // StatSource yields the running decision counters for each beat.
 type StatSource interface {
-	Stats() (total, denies, errors int)
+	Stats() (total, denies, errors, dropped int)
 }
 
 type Sender struct {
@@ -45,7 +45,7 @@ func (s *Sender) Run(ctx context.Context, interval time.Duration) {
 }
 
 func (s *Sender) beat(ctx context.Context) {
-	total, denies, errs := s.stats.Stats()
+	total, denies, errs, dropped := s.stats.Stats()
 	payload := map[string]any{
 		"tenant":          s.tenant,
 		"agent_id":        s.entityID,
@@ -53,6 +53,7 @@ func (s *Sender) beat(ctx context.Context) {
 		"decisions_total": total,
 		"denies_total":    denies,
 		"errors_total":    errs,
+		"dropped_total":   dropped,
 		"metadata":        map[string]any{"role": "guard", "mode": s.mode},
 	}
 	body, err := json.Marshal(payload)

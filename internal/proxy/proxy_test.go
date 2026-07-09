@@ -124,6 +124,125 @@ func TestConnectMitmDeniesHttpsWrite(t *testing.T) {
 	}
 }
 
+// The host-binding fix: an agent CONNECTs to one authority, then sends an inner
+// Host header for another to try to earn an allow (and audit entry) against the
+// wrong destination. The guard must bind policy to the CONNECT authority and
+// deny the mismatch outright — never evaluate the spoofed host.
+func TestConnectMitmDeniesInnerHostMismatch(t *testing.T) {
+	addr := "127.0.0.1:18904"
+	rec, authority := newGuard(t, addr, nil)
+
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	// CONNECT to api.github.com — the trusted authority.
+	if _, err := raw.Write([]byte("CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(raw)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT not established: %q", status)
+	}
+	for {
+		line, _ := br.ReadString('\n')
+		if line == "\r\n" || line == "" {
+			break
+		}
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(authority.CertPEM())
+	// SNI matches the CONNECT authority (as a real client would send).
+	tlsConn := tls.Client(&connWrap{Conn: raw, r: br}, &tls.Config{ServerName: "api.github.com", RootCAs: pool})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake through MITM failed: %v", err)
+	}
+
+	// A GET (normally allowed) but with the inner Host spoofed to a different
+	// authority. Bind was to api.github.com, so this must be denied on mismatch,
+	// not evaluated against api.anthropic.com.
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/v1/messages", nil)
+	req.Host = "api.anthropic.com"
+	if err := req.Write(tlsConn); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("spoofed inner Host: got %d, want 403", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "host_mismatch") {
+		t.Fatalf("spoofed inner Host: body %q, want host_mismatch reason", body)
+	}
+	// The recorded deny must be keyed to the trusted authority, never the spoof.
+	if total, denies, _ := rec.Stats(); denies < 1 || total < 1 {
+		t.Fatalf("host_mismatch deny not recorded: total=%d denies=%d", total, denies)
+	}
+}
+
+// The matching case: same CONNECT authority, inner Host agrees, an allowed
+// method (GET) governs normally and is forwarded — no host_mismatch, no deny.
+// The upstream dial is expected to fail (no real api.github.com in the test), so
+// the guard returns 502 AFTER allowing; the recorder proves the allow ran.
+func TestConnectMitmAllowsMatchingInnerHost(t *testing.T) {
+	addr := "127.0.0.1:18905"
+	rec, authority := newGuard(t, addr, nil)
+
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	// CONNECT to api.github.com — the trusted authority.
+	if _, err := raw.Write([]byte("CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(raw)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT not established: %q", status)
+	}
+	for {
+		line, _ := br.ReadString('\n')
+		if line == "\r\n" || line == "" {
+			break
+		}
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(authority.CertPEM())
+	tlsConn := tls.Client(&connWrap{Conn: raw, r: br}, &tls.Config{ServerName: "api.github.com", RootCAs: pool})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake through MITM failed: %v", err)
+	}
+
+	// GET with inner Host matching the CONNECT authority: allowed, then forwarded.
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/repos/x/y", nil)
+	if err := req.Write(tlsConn); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	// A matching, allowed request is NOT a 403: it either reaches upstream (200)
+	// or fails the upstream dial (502). What it must never be is a policy 403.
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("matching inner Host GET was denied 403; want it allowed/forwarded")
+	}
+	if total, denies, _ := rec.Stats(); total < 1 || denies != 0 {
+		t.Fatalf("matching request not recorded as allow: total=%d denies=%d", total, denies)
+	}
+}
+
 func TestForwardHttpGoverns(t *testing.T) {
 	addr := "127.0.0.1:18902"
 	rec, _ := newGuard(t, addr, nil)

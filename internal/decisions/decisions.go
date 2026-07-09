@@ -7,12 +7,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
 	"sync"
 	"time"
 )
+
+// maxPending caps the queued-record backlog. On a prolonged CP outage the queue
+// would otherwise grow unbounded and OOM the guard. At the cap we drop the
+// NEWEST record (before it is chained) so the hash-chain of queued rows stays
+// gap-free - dropping an already-chained row would break linkage verification.
+const maxPending = 50000
 
 // Record is one egress decision, shaped to the CP's DecisionIn model. Only the
 // fields the guard populates are set; the rest serialize as null/zero.
@@ -86,9 +93,10 @@ type Recorder struct {
 	pending []Record
 	sampled map[string]int
 
-	denies int
-	errors int
-	total  int
+	denies  int
+	errors  int
+	total   int
+	dropped int
 }
 
 type chainState struct {
@@ -153,6 +161,14 @@ func (r *Recorder) Add(method, host, path, decision, policyID, reason, redaction
 			return
 		}
 		r.sampled[sig] = 1
+	}
+
+	// Enforce the backlog cap before touching the chain. Dropping here - after
+	// the collapse bookkeeping but before we assign seq/prev/hash - keeps the
+	// queued rows contiguous: we never chain a row we then discard.
+	if len(r.pending) >= maxPending {
+		r.dropped++
+		return
 	}
 
 	r.seq++
@@ -237,21 +253,40 @@ func (r *Recorder) flush(ctx context.Context) {
 
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		r.mu.Lock()
-		r.errors++
-		r.pending = append(batch, r.pending...)
-		r.mu.Unlock()
+		r.requeue(batch)
 		return
 	}
+	// Drain + close in every path so the connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+
+	// A non-2xx means the CP did NOT store the batch. Treat it exactly like a
+	// transport failure: re-queue and do NOT advance the persisted cursor.
+	// saveState-ing here would push the chain cursor past a row the CP never
+	// received, permanently corrupting chain verification.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		r.requeue(batch)
+		return
+	}
 
 	last := batch[len(batch)-1]
 	r.saveState(last.Seq, last.RowHash)
 }
 
-// Stats returns running counters for the heartbeat.
-func (r *Recorder) Stats() (total, denies, errors int) {
+// requeue puts a failed batch back at the head of the pending queue and bumps
+// the error counter. The batch is prepended so ordering (and thus chain
+// linkage) is preserved against records added while the flush was in flight.
+func (r *Recorder) requeue(batch []Record) {
+	r.mu.Lock()
+	r.errors++
+	r.pending = append(batch, r.pending...)
+	r.mu.Unlock()
+}
+
+// Stats returns running counters for the heartbeat. dropped is the number of
+// records shed at the backlog cap (a CP-outage signal worth surfacing).
+func (r *Recorder) Stats() (total, denies, errors, dropped int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.total, r.denies, r.errors
+	return r.total, r.denies, r.errors, r.dropped
 }

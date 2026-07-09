@@ -30,15 +30,49 @@ type Deps struct {
 	CA        *ca.CA
 	Pol       *policy.Client
 	Rec       *decisions.Recorder
-	Essential map[string]bool
+	Essential EssentialSet
 }
 
-func Essentials(hosts []string) map[string]bool {
-	set := map[string]bool{}
+// EssentialSet matches hosts that stay reachable when OPA is down. A plain
+// entry ("api.anthropic.com") matches only that exact host; an entry beginning
+// with a dot (".openai.azure.com") matches any host ending in that suffix, so a
+// whole provider domain can be covered without listing every subdomain.
+type EssentialSet struct {
+	exact    map[string]bool
+	suffixes []string
+}
+
+func Essentials(hosts []string) EssentialSet {
+	s := EssentialSet{exact: map[string]bool{}}
 	for _, h := range hosts {
-		set[strings.ToLower(h)] = true
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		if strings.HasPrefix(h, ".") {
+			s.suffixes = append(s.suffixes, h)
+			continue
+		}
+		s.exact[h] = true
 	}
-	return set
+	return s
+}
+
+// Has reports whether host is essential, by exact match or by matching any
+// registered suffix entry. host is compared case-insensitively.
+func (s EssentialSet) Has(host string) bool {
+	host = strings.ToLower(host)
+	if s.exact[host] {
+		return true
+	}
+	for _, suf := range s.suffixes {
+		// suf is ".example.com"; match a subdomain ("x.example.com") and the
+		// bare apex ("example.com"), but never a substring ("notexample.com").
+		if strings.HasSuffix(host, suf) || host == suf[1:] {
+			return true
+		}
+	}
+	return false
 }
 
 // ServeTLS terminates the client's TLS with a minted leaf, then governs each
@@ -91,7 +125,7 @@ func (d Deps) Decide(method, host, path, body string, headers map[string]string)
 	if err == nil {
 		return dec
 	}
-	if d.Essential[strings.ToLower(host)] {
+	if d.Essential.Has(host) {
 		return &policy.Decision{Allowed: true, HTTPStatus: http.StatusOK, Reason: "opa_unavailable_essential", Enforced: true}
 	}
 	return &policy.Decision{Allowed: false, HTTPStatus: http.StatusServiceUnavailable, PolicyID: "guard", Reason: "policy_unavailable", Enforced: true}

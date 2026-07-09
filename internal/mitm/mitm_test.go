@@ -41,6 +41,51 @@ func TestPeekBodyNil(t *testing.T) {
 	}
 }
 
+func TestEssentialsExactMatch(t *testing.T) {
+	set := Essentials([]string{"api.anthropic.com", "chatgpt.com"})
+	if !set.Has("api.anthropic.com") {
+		t.Fatal("exact host should match")
+	}
+	if !set.Has("API.Anthropic.COM") {
+		t.Fatal("match should be case-insensitive")
+	}
+	// A plain entry must not leak into subdomains or siblings.
+	if set.Has("evil.api.anthropic.com") {
+		t.Fatal("exact entry must not match a subdomain")
+	}
+	if set.Has("api.openai.com") {
+		t.Fatal("non-listed host should not match")
+	}
+}
+
+func TestEssentialsSuffixMatch(t *testing.T) {
+	set := Essentials([]string{".openai.azure.com"})
+	if !set.Has("myresource.openai.azure.com") {
+		t.Fatal("suffix entry should match a subdomain")
+	}
+	if !set.Has("openai.azure.com") {
+		t.Fatal("suffix entry should match the bare domain too")
+	}
+	// A host merely containing the suffix as a substring must not match.
+	if set.Has("notopenai.azure.com.evil.com") {
+		t.Fatal("suffix entry must anchor at the end of the host")
+	}
+	if set.Has("api.anthropic.com") {
+		t.Fatal("suffix entry should reject a non-match")
+	}
+}
+
+func TestEssentialsConfigOverridesDefaults(t *testing.T) {
+	// A config-driven set is exactly what's passed in — nothing implicit.
+	set := Essentials([]string{"models.internal.example"})
+	if !set.Has("models.internal.example") {
+		t.Fatal("config-driven host should match")
+	}
+	if set.Has("api.anthropic.com") {
+		t.Fatal("config-driven set must not carry over any defaults")
+	}
+}
+
 func TestHeaderMapLowercasesAndJoins(t *testing.T) {
 	r := httptest.NewRequest("POST", "https://api/x", nil)
 	r.Header.Set("X-Amz-Target", "DynamoDB_20120810.DeleteTable")

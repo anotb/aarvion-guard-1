@@ -128,7 +128,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// falls back to a host-level tunnel so the agent keeps working. Any other
 		// host fails closed: silently downgrading a governed host to host-level
 		// would let writes bypass body/path policy.
-		if s.deps.Essential[host] || s.passthrough[host] {
+		if s.deps.Essential.Has(host) || s.passthrough[host] {
 			s.learn(host)
 			fmt.Fprintf(os.Stderr, "[guard] %s rejected inspection (%v); passing it through (essential/allowlisted)\n", host, err)
 		} else {

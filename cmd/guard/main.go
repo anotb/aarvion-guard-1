@@ -415,6 +415,22 @@ func attachSinks(ctx context.Context, cfg *config.Config, rec *decisions.Recorde
 		fmt.Printf("deny webhook posting to %s\n", obs.DenyWebhookURL)
 	}
 
+	// Learn-mode observer: joins the SAME fanout as the other sinks (so one
+	// SetSink still drives JSONL + webhook + metrics + learn), tallies distinct
+	// egress hosts, and writes a promotable proposed-allowlist file. Its ticker
+	// shares ctx; closeSinks (below) closes it for the final write.
+	if cfg.Learn.Enabled {
+		path := cfg.Learn.ProposalPath
+		if path == "" {
+			path = config.ProposalPath()
+		}
+		ls := sinks.NewLearn(path, time.Duration(cfg.Learn.WriteEverySeconds)*time.Second)
+		members = append(members, ls)
+		closers = append(closers, func() { _ = ls.Close() })
+		go ls.Run(ctx)
+		fmt.Printf("learn observer proposing allowlist to %s\n", path)
+	}
+
 	if m := sinks.NewMulti(members...); m.Len() > 0 {
 		rec.SetSink(m)
 	}

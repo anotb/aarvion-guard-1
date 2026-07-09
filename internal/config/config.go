@@ -33,6 +33,23 @@ type Config struct {
 	Observability Observability `json:"observability,omitempty"`
 	RateLimit     RateLimit     `json:"rate_limit,omitempty"`
 	Allowlist     Allowlist     `json:"allowlist,omitempty"`
+	Learn         Learn         `json:"learn,omitempty"`
+}
+
+// Learn configures the learn-mode observer: it watches real egress and writes a
+// *proposed allowlist* of every distinct destination host it saw, so an operator
+// reviews-and-promotes into allowlist.hosts instead of hand-authoring. It's the
+// onboarding unlock for default-deny. When Enabled is false (or the struct is
+// absent) no observer is built and there is zero overhead.
+//
+//   - ProposalPath: where the 0600 JSON proposal is written (defaults to
+//     ~/.aarvion/proposed-allowlist.json when empty).
+//   - WriteEverySeconds: how often the proposal is rewritten (defaults to 30s
+//     when unset/non-positive). A final write always happens on shutdown.
+type Learn struct {
+	Enabled           bool   `json:"enabled"`
+	ProposalPath      string `json:"proposal_path,omitempty"`
+	WriteEverySeconds int    `json:"write_every_seconds,omitempty"`
 }
 
 // Allowlist configures the default-deny egress gate: only approved (or
@@ -117,6 +134,10 @@ func OPAConfigPath() string { return filepath.Join(Dir(), "opa-config.yaml") }
 
 // ChainPath persists the decision hash-chain cursor so it survives restarts.
 func ChainPath() string { return filepath.Join(Dir(), "chain.json") }
+
+// ProposalPath is the default location for the learn observer's proposed
+// allowlist, used when learn.proposal_path is unset.
+func ProposalPath() string { return filepath.Join(Dir(), "proposed-allowlist.json") }
 
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())

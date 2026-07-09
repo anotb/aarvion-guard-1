@@ -17,6 +17,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
+	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
@@ -61,7 +62,7 @@ func newGuard(t *testing.T, addr string, passthrough []string) (*decisions.Recor
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, passthrough, true, nil)
+	srv := New(addr, authority, pol, rec, nil, passthrough, true, nil, mitm.Allowlist{})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
@@ -86,7 +87,7 @@ func newRateLimitedGuard(t *testing.T, addr string, limiter *ratelimit.Limiter) 
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, nil, true, limiter)
+	srv := New(addr, authority, pol, rec, nil, nil, true, limiter, mitm.Allowlist{})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
@@ -169,6 +170,109 @@ func TestForwardHttpNilLimiterUnchanged(t *testing.T) {
 	}
 	if _, denies, _, _ := rec.Stats(); denies != 0 {
 		t.Fatalf("nil limiter produced %d denies, want 0", denies)
+	}
+}
+
+// newAllowlistGuard starts a forward proxy whose OPA allows every request, so any
+// deny observed comes purely from the default-deny allowlist. Used to prove that
+// enforce mode denies a novel host while an allowlisted host is forwarded,
+// end-to-end through the real proxy handler.
+func newAllowlistGuard(t *testing.T, addr string, allowlist mitm.Allowlist) *decisions.Recorder {
+	t.Helper()
+	opa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{"allowed": true}})
+	}))
+	t.Cleanup(opa.Close)
+	dir := t.TempDir()
+	authority, err := ca.EnsureCA(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
+	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
+	srv := New(addr, authority, pol, rec, nil, nil, true, nil, allowlist)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.ListenAndServe(ctx) }()
+	waitListening(t, addr)
+	return rec
+}
+
+// Enforce mode denies a novel (non-allowlisted, non-essential) host with a
+// not_allowlisted 403 through the real forward-proxy handler, recorded as a deny;
+// an allowlisted host is governed by OPA and forwarded. The allowlist is keyed on
+// the proxied Host (127.0.0.1 for the httptest upstream), so listing that host
+// lets the allowed request through while a bogus host is denied outright.
+func TestForwardHttpAllowlistEnforce(t *testing.T) {
+	addr := "127.0.0.1:18908"
+	rec := newAllowlistGuard(t, addr, mitm.Allowlist{
+		Mode:  mitm.AllowlistEnforce,
+		Hosts: mitm.Essentials([]string{"127.0.0.1"}),
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "upstream-ok")
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse("http://" + addr)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	// Allowlisted host (127.0.0.1 upstream): governed by OPA (allows) → forwarded.
+	resp1, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if resp1.StatusCode != 200 || string(body1) != "upstream-ok" {
+		t.Fatalf("allowlisted host: got %d %q, want 200 upstream-ok", resp1.StatusCode, body1)
+	}
+
+	// Novel host: a plain (non-CONNECT) proxied request to a host not on the
+	// allowlist. Denied 403 not_allowlisted before OPA or any upstream dial.
+	req, _ := http.NewRequest(http.MethodGet, "http://novel.example.invalid/", nil)
+	resp2, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("novel host: got %d %q, want 403", resp2.StatusCode, body2)
+	}
+	if !strings.Contains(string(body2), "not_allowlisted") {
+		t.Fatalf("novel-host body = %q, want not_allowlisted", body2)
+	}
+	if _, denies, _, _ := rec.Stats(); denies < 1 {
+		t.Fatalf("allowlist deny not recorded: denies=%d", denies)
+	}
+}
+
+// A disabled allowlist (off/empty mode) leaves the forward proxy behaving exactly
+// as before: a host that would be "novel" under a gate is forwarded normally.
+func TestForwardHttpAllowlistDisabledUnchanged(t *testing.T) {
+	addr := "127.0.0.1:18909"
+	rec := newAllowlistGuard(t, addr, mitm.Allowlist{}) // off
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse("http://" + addr)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	resp, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("disabled allowlist: got %d, want 200 (unchanged behavior)", resp.StatusCode)
+	}
+	if _, denies, _, _ := rec.Stats(); denies != 0 {
+		t.Fatalf("disabled allowlist produced %d denies, want 0", denies)
 	}
 }
 

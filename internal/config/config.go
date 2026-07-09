@@ -32,6 +32,19 @@ type Config struct {
 	Govern        Govern        `json:"govern,omitempty"`
 	Observability Observability `json:"observability,omitempty"`
 	RateLimit     RateLimit     `json:"rate_limit,omitempty"`
+	Allowlist     Allowlist     `json:"allowlist,omitempty"`
+}
+
+// Allowlist configures the default-deny egress gate: only approved (or
+// essential) hosts may be reached; a novel host is denied in enforce mode, or
+// allowed-but-flagged in observe mode so an operator can see what enforcement
+// would block before switching it on. Mode is one of off|observe|enforce; an
+// empty/off mode (or an absent struct) disables gating with zero behavior
+// change. Hosts entries match like essential_hosts: a plain entry is an exact
+// host, a "."-prefixed entry matches that domain and all its subdomains.
+type Allowlist struct {
+	Mode  string   `json:"mode,omitempty"`
+	Hosts []string `json:"hosts,omitempty"`
 }
 
 // RateLimit configures the in-guard, per-destination-host egress rate ceiling

@@ -21,10 +21,10 @@ type Server struct {
 	origDst func(net.Conn) (netip.AddrPort, error)
 }
 
-func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error), limiter *ratelimit.Limiter) *Server {
+func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error), limiter *ratelimit.Limiter, allowlist mitm.Allowlist) *Server {
 	return &Server{
 		addr:    addr,
-		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter},
+		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist},
 		origDst: origDst,
 	}
 }

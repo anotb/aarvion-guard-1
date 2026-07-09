@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -276,6 +277,212 @@ func TestServePlainRateLimitedRecordsDeny(t *testing.T) {
 	// The over-limit request must be recorded as a deny (feeds denies_total etc.).
 	if _, denies, _, _ := rec.Stats(); denies < 1 {
 		t.Fatalf("rate-limited deny not recorded: denies=%d", denies)
+	}
+}
+
+// denyAllOPA is an OPA stub that denies every request with a 403 and a fixed
+// reason, so observe-mode tests can prove an OPA deny keeps OPA's reason rather
+// than being overwritten by the novel-host marker.
+func denyAllOPA(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
+			"allowed":     false,
+			"http_status": 403,
+			"headers":     map[string]string{"x-policy-violated": "opa_pol", "x-policy-reason": "opa_denied"},
+		}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// Enforce mode denies a novel host outright with not_allowlisted (403) and never
+// calls OPA, while an allowlisted host and an essential host both proceed to OPA
+// and are allowed. This is the default-deny egress posture.
+func TestDecideAllowlistEnforce(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{
+		Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:       decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Essential: Essentials([]string{"api.anthropic.com"}),
+		Allowlist: Allowlist{Mode: AllowlistEnforce, Hosts: Essentials([]string{"api.github.com"})},
+	}
+
+	// A novel host (neither allowlisted nor essential) is denied without OPA.
+	dec := d.Decide("GET", "evil.example", "/", "", nil)
+	if dec.Allowed {
+		t.Fatal("novel host must be denied in enforce mode")
+	}
+	if dec.HTTPStatus != http.StatusForbidden || dec.Reason != "not_allowlisted" || dec.PolicyID != "guard" || !dec.Enforced {
+		t.Fatalf("novel-host deny = %+v, want 403 not_allowlisted policy_id=guard enforced=true", dec)
+	}
+
+	// An allowlisted host proceeds to OPA and is allowed (OPA allows everything).
+	if dec := d.Decide("GET", "api.github.com", "/", "", nil); !dec.Allowed || dec.Reason == "not_allowlisted" {
+		t.Fatalf("allowlisted host should be allowed via OPA: %+v", dec)
+	}
+
+	// An essential host is implicitly allowed through the gate (model keeps working).
+	if dec := d.Decide("GET", "api.anthropic.com", "/", "", nil); !dec.Allowed || dec.Reason == "not_allowlisted" {
+		t.Fatalf("essential host should pass the gate and be allowed via OPA: %+v", dec)
+	}
+}
+
+// Enforce mode honors "."-suffix allowlist entries: a subdomain of an allowed
+// domain proceeds to OPA, while an unrelated host is denied.
+func TestDecideAllowlistEnforceSuffixMatch(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{
+		Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:       decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Allowlist: Allowlist{Mode: AllowlistEnforce, Hosts: Essentials([]string{".corp.example"})},
+	}
+	if dec := d.Decide("GET", "api.corp.example", "/", "", nil); !dec.Allowed {
+		t.Fatalf("suffix-matched subdomain should be allowed: %+v", dec)
+	}
+	if dec := d.Decide("GET", "corp.example", "/", "", nil); !dec.Allowed {
+		t.Fatalf("suffix entry should match the bare apex too: %+v", dec)
+	}
+	if dec := d.Decide("GET", "other.example", "/", "", nil); dec.Allowed || dec.Reason != "not_allowlisted" {
+		t.Fatalf("non-suffix host should be denied not_allowlisted: %+v", dec)
+	}
+}
+
+// Observe mode never denies on novelty: a novel host proceeds to OPA and, when
+// OPA allows it, the decision is flagged novel_host_observed so the operator sees
+// what enforce mode WOULD block. An allowlisted host allowed by OPA keeps a
+// normal (empty) reason — the marker is for novel hosts only.
+func TestDecideAllowlistObserveMarksNovel(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{
+		Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:       decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Allowlist: Allowlist{Mode: AllowlistObserve, Hosts: Essentials([]string{"api.github.com"})},
+	}
+
+	// Novel host: allowed (observe never blocks) but flagged.
+	dec := d.Decide("GET", "novel.example", "/", "", nil)
+	if !dec.Allowed {
+		t.Fatalf("observe mode must not deny a novel host: %+v", dec)
+	}
+	if dec.Reason != "novel_host_observed" {
+		t.Fatalf("novel host in observe mode = %+v, want reason novel_host_observed", dec)
+	}
+
+	// Allowlisted host: allowed with a normal (empty) reason — not flagged.
+	if dec := d.Decide("GET", "api.github.com", "/", "", nil); !dec.Allowed || dec.Reason != "" {
+		t.Fatalf("allowlisted host in observe mode = %+v, want allowed with empty reason", dec)
+	}
+}
+
+// In observe mode, if OPA itself denies a novel host the OPA reason is kept — the
+// novel-host marker only overrides the reason on an OPA allow.
+func TestDecideAllowlistObserveKeepsOPADeny(t *testing.T) {
+	opa := denyAllOPA(t)
+	d := Deps{
+		Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:       decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+		Allowlist: Allowlist{Mode: AllowlistObserve},
+	}
+	dec := d.Decide("POST", "novel.example", "/", "", nil)
+	if dec.Allowed {
+		t.Fatal("OPA denied, so the decision must be a deny")
+	}
+	if dec.Reason == "novel_host_observed" {
+		t.Fatalf("OPA deny reason must be kept, not overwritten by the observe marker: %+v", dec)
+	}
+}
+
+// A disabled (off / empty-mode) allowlist must not change the decision path at
+// all: a host that would be novel under a gate is governed by OPA exactly as
+// before the feature.
+func TestDecideAllowlistDisabledUnchanged(t *testing.T) {
+	opa := allowAllOPA(t)
+	for _, mode := range []string{"", AllowlistOff} {
+		d := Deps{
+			Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+			Rec:       decisions.New("http://cp.invalid", "t", "e", "tok", "dp", ""),
+			Allowlist: Allowlist{Mode: mode},
+		}
+		dec := d.Decide("GET", "anything.example", "/", "", nil)
+		if !dec.Allowed {
+			t.Fatalf("disabled allowlist (mode=%q) must leave an OPA-allowed request allowed: %+v", mode, dec)
+		}
+		if dec.Reason == "not_allowlisted" || dec.Reason == "novel_host_observed" {
+			t.Fatalf("disabled allowlist (mode=%q) must not add any allowlist marker: %+v", mode, dec)
+		}
+	}
+}
+
+// captureSink records every finalized decision row so a test can assert on the
+// audit fields (reason etc.) that flow to the JSONL / webhook / CP sinks.
+type captureSink struct {
+	mu   sync.Mutex
+	rows []decisions.Record
+}
+
+func (c *captureSink) Record(r decisions.Record) {
+	c.mu.Lock()
+	c.rows = append(c.rows, r)
+	c.mu.Unlock()
+}
+
+func (c *captureSink) reasonFor(host string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.rows {
+		if r.Host == host {
+			return r.Reason, true
+		}
+	}
+	return "", false
+}
+
+// End-to-end over ServePlain with a capturing sink: observe mode lets a novel
+// host through but the recorded ALLOW row carries reason novel_host_observed (the
+// single change that surfaces the marker in the JSONL/webhook/CP audit), while an
+// allowlisted host's allow row keeps an empty reason (normal allow rows are
+// unchanged). Both requests are allowed by OPA; the upstream dial then fails (502),
+// but the allow is recorded first, which is what we assert on.
+func TestServePlainObserveMarksNovelInAudit(t *testing.T) {
+	opa := allowAllOPA(t)
+	sink := &captureSink{}
+	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
+	rec.SetSink(sink)
+	d := Deps{
+		Pol:       policy.New(strings.TrimPrefix(opa.URL, "http://")),
+		Rec:       rec,
+		Allowlist: Allowlist{Mode: AllowlistObserve, Hosts: Essentials([]string{"good.example"})},
+	}
+
+	// Drive one governed request whose dial authority (a hostname) binds the host.
+	do := func(host string) {
+		client, server := net.Pipe()
+		defer client.Close()
+		go d.ServePlain(server, host+":80") // hostname authority → port 80 dial fails after the allow
+		_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+		if err != nil {
+			t.Fatalf("read response for %s: %v", host, err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	do("novel.example") // not allowlisted → observed
+	do("good.example")  // allowlisted → normal allow
+
+	// The novel host's allow row is flagged so an operator sees what enforce would
+	// block; this is exactly what reaches the observability sinks and the CP.
+	if reason, ok := sink.reasonFor("novel.example"); !ok || reason != "novel_host_observed" {
+		t.Fatalf("novel.example allow row reason = %q (found=%v), want novel_host_observed", reason, ok)
+	}
+	// A normal allowed row is untouched: empty reason.
+	if reason, ok := sink.reasonFor("good.example"); !ok || reason != "" {
+		t.Fatalf("good.example allow row reason = %q (found=%v), want empty", reason, ok)
 	}
 }
 

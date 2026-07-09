@@ -83,6 +83,18 @@ func buildLimiter(cfg *config.Config) *ratelimit.Limiter {
 	return ratelimit.New(rl.PerMinute, time.Minute, rl.PerHost)
 }
 
+// buildAllowlist constructs the default-deny egress gate from config. An off or
+// empty mode yields a zero-value Allowlist (gating disabled), which the mitm
+// Decide path treats exactly as the pre-feature behavior. Host matching reuses
+// mitm.Essentials so "."-suffix entries work like essential_hosts.
+func buildAllowlist(cfg *config.Config) mitm.Allowlist {
+	al := cfg.Allowlist
+	if al.Mode == "" || al.Mode == mitm.AllowlistOff {
+		return mitm.Allowlist{}
+	}
+	return mitm.Allowlist{Mode: al.Mode, Hosts: mitm.Essentials(al.Hosts)}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -287,6 +299,14 @@ func cmdRun() {
 		fmt.Printf("egress rate limit active (%d/min per host, %d host overrides)\n", cfg.RateLimit.PerMinute, len(cfg.RateLimit.PerHost))
 	}
 
+	// Optional default-deny egress allowlist: a novel host is denied (enforce) or
+	// allowed-but-flagged (observe) before OPA. A zero-value allowlist (off/empty
+	// mode) disables gating and preserves the prior behavior.
+	allowlist := buildAllowlist(cfg)
+	if allowlist.Mode != "" {
+		fmt.Printf("egress allowlist active (mode=%s, %d hosts)\n", allowlist.Mode, len(cfg.Allowlist.Hosts))
+	}
+
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
@@ -310,7 +330,7 @@ func cmdRun() {
 	}
 
 	if cfg.Mode == config.ModeTransparent {
-		runTransparent(ctx, cfg, pol, rec, limiter)
+		runTransparent(ctx, cfg, pol, rec, limiter, allowlist)
 	} else {
 		var authority *ca.CA
 		if cfg.Inspect {
@@ -320,7 +340,7 @@ func cmdRun() {
 			}
 			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter, allowlist)
 		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
@@ -329,7 +349,7 @@ func cmdRun() {
 	fmt.Println("guard stopped")
 }
 
-func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter) {
+func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter, allowlist mitm.Allowlist) {
 	gid, err := ensureGroup(cfg.GuardGroup)
 	if err != nil {
 		fatal(fmt.Errorf("group %q: %w (run with sudo)", cfg.GuardGroup, err))
@@ -353,7 +373,7 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	// OpenClaw's egress black-holed.
 	defer func() { _ = backend.Remove() }()
 
-	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter)
+	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter, allowlist)
 	fmt.Printf("guard intercepting on %s (mode=transparent, group=%s, entity=%s)\n", cfg.TransparentAddr, cfg.GuardGroup, cfg.EntityID)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)

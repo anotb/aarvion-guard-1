@@ -34,14 +34,14 @@ type Server struct {
 	blocked map[string]bool
 }
 
-func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool, limiter *ratelimit.Limiter) *Server {
+func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool, limiter *ratelimit.Limiter, allowlist mitm.Allowlist) *Server {
 	pt := map[string]bool{}
 	for _, h := range passthrough {
 		pt[strings.ToLower(h)] = true
 	}
 	return &Server{
 		addr:        addr,
-		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter},
+		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist},
 		passthrough: pt,
 		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},
@@ -150,7 +150,9 @@ func (s *Server) splice(w http.ResponseWriter, r *http.Request, host string, hj 
 		http.Error(w, d.Reason, d.HTTPStatus)
 		return
 	}
-	s.deps.Rec.Add(http.MethodConnect, host, "/", "allow", "", "", d.Redactions, d.Enforced, latency)
+	// dec.Reason is "" for a normal allow but carries the observe-mode
+	// "novel_host_observed" marker; recording it surfaces that marker in the audit.
+	s.deps.Rec.Add(http.MethodConnect, host, "/", "allow", "", d.Reason, d.Redactions, d.Enforced, latency)
 	upstream, err := net.DialTimeout("tcp", r.Host, 15*time.Second)
 	if err != nil {
 		http.Error(w, "upstream dial failed", http.StatusBadGateway)
@@ -184,7 +186,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, d.Reason, d.HTTPStatus)
 		return
 	}
-	s.deps.Rec.Add(r.Method, host, r.URL.Path, "allow", "", "", d.Redactions, d.Enforced, latency)
+	// dec.Reason is "" for a normal allow but carries the observe-mode
+	// "novel_host_observed" marker; recording it surfaces that marker in the audit.
+	s.deps.Rec.Add(r.Method, host, r.URL.Path, "allow", "", d.Reason, d.Redactions, d.Enforced, latency)
 
 	r.RequestURI = ""
 	resp, err := s.transport.RoundTrip(r)

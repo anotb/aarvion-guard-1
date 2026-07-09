@@ -37,7 +37,30 @@ type Deps struct {
 	// BEFORE OPA (see Decide). A nil Limiter disables rate limiting entirely and
 	// preserves the pre-feature behavior exactly.
 	Limiter *ratelimit.Limiter
+
+	// Allowlist is an optional default-deny egress gate keyed on destination
+	// host, checked AFTER the rate limiter but BEFORE OPA (see Decide). Its zero
+	// value (mode "") disables gating entirely and preserves the pre-feature
+	// behavior exactly.
+	Allowlist Allowlist
 }
+
+// Allowlist configures a default-deny egress posture: only approved (or
+// essential) hosts may be reached; anything novel is denied — or, in observe
+// mode, allowed but flagged so an operator sees what enforcement WOULD block.
+// Hosts reuses EssentialSet so a "."-prefixed entry matches by host suffix, the
+// same as essential_hosts.
+type Allowlist struct {
+	Mode  string // one of AllowlistOff, AllowlistObserve, AllowlistEnforce
+	Hosts EssentialSet
+}
+
+// Allowlist modes. Off (or an empty mode) disables gating entirely.
+const (
+	AllowlistOff     = "off"
+	AllowlistObserve = "observe"
+	AllowlistEnforce = "enforce"
+)
 
 // EssentialSet matches hosts that stay reachable when OPA is down. A plain
 // entry ("api.anthropic.com") matches only that exact host; an entry beginning
@@ -168,14 +191,42 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 // memory, so a runaway loop is cut off cheaply without loading OPA, and — because
 // it keys on host — it works in no-inspect mode too. A nil limiter skips this
 // block entirely, preserving the exact prior behavior.
+//
+// The default-deny allowlist is checked SECOND, after the limiter but before
+// OPA, and only when a mode is configured. A novel host (neither allowlisted nor
+// essential) is denied outright in enforce mode (403, reason "not_allowlisted")
+// without calling OPA; in observe mode it proceeds to OPA and, if OPA allows it,
+// the returned decision's Reason is overwritten to "novel_host_observed" so the
+// operator sees what enforcement WOULD block. An off/empty mode skips this block
+// entirely, preserving the exact prior behavior.
 func (d Deps) Decide(method, host, path, body string, headers map[string]string) *policy.Decision {
 	if d.Limiter != nil && !d.Limiter.Allow(host, time.Now()) {
 		return &policy.Decision{Allowed: false, HTTPStatus: http.StatusTooManyRequests, PolicyID: "guard", Reason: "rate_limited", Enforced: true}
+	}
+	novel := false
+	switch d.Allowlist.Mode {
+	case "", AllowlistOff:
+		// No allowlist gating: today's implicit allow-with-denies posture.
+	default:
+		if !d.Allowlist.Hosts.Has(host) && !d.Essential.Has(host) {
+			// Neither explicitly allowlisted nor essential → a novel host.
+			if d.Allowlist.Mode == AllowlistEnforce {
+				return &policy.Decision{Allowed: false, HTTPStatus: http.StatusForbidden, PolicyID: "guard", Reason: "not_allowlisted", Enforced: true}
+			}
+			// Observe mode: let OPA rule on it, but remember to flag it below.
+			novel = true
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dec, err := d.Pol.Eval(ctx, method, host, path, body, headers)
 	if err == nil {
+		// In observe mode, a novel host that OPA allowed is flagged so the audit
+		// shows what enforce mode WOULD have blocked. If OPA itself denied it, keep
+		// OPA's reason — the operator already sees the deny.
+		if novel && dec.Allowed {
+			dec.Reason = "novel_host_observed"
+		}
 		return dec
 	}
 	if d.Essential.Has(host) {
@@ -218,7 +269,10 @@ func (d Deps) serve(conn net.Conn, scheme, governHost string, denyMismatch bool,
 			http.Error(w, dec.Reason, dec.HTTPStatus)
 			return
 		}
-		d.Rec.Add(r.Method, host, r.URL.Path, "allow", "", "", dec.Redactions, dec.Enforced, latency)
+		// Pass dec.Reason on allows too (it's "" for a normal allow, but carries the
+		// "novel_host_observed" marker in observe mode) so observe-mode markers
+		// reach the audit / webhook / CP without changing normal allow rows.
+		d.Rec.Add(r.Method, host, r.URL.Path, "allow", "", dec.Reason, dec.Redactions, dec.Enforced, latency)
 		r.URL.Scheme = scheme
 		r.URL.Host = r.Host
 		proxy.ServeHTTP(w, r)

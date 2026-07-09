@@ -40,9 +40,27 @@ type Record struct {
 	Surface        string `json:"surface,omitempty"`
 	EntityID       string `json:"entity_id,omitempty"`
 	Direction      string `json:"direction,omitempty"`
-	PrevHash       string `json:"prev_hash"`
-	RowHash        string `json:"row_hash"`
+
+	// Governance metadata (set by the runtime PDP path). These are row metadata
+	// only: they are NOT fed into rowHash, so a governed row's row_hash matches
+	// what the proxy path would produce for the same core decision. Do not add
+	// any of these to hashFields without reconciling the DP shipper + CP verify.
+	CallerPrincipalID string `json:"caller_principal_id,omitempty"`
+	CallerSessionID   string `json:"caller_session_id,omitempty"`
+	CallerSource      string `json:"caller_source,omitempty"`
+	Phase             string `json:"phase,omitempty"`
+	Origin            string `json:"origin,omitempty"`
+
+	PrevHash string `json:"prev_hash"`
+	RowHash  string `json:"row_hash"`
 }
+
+// Origin distinguishes where a decision was made: the transparent/forward proxy
+// (MITM egress) versus the runtime PDP over the local socket.
+const (
+	OriginProxy   = "proxy"
+	OriginRuntime = "runtime"
+)
 
 // hashFields is the ordered field set hashed into each row's row_hash. The CP's
 // decision-chain verify is linkage-only (each row's prev_hash == the prior row's
@@ -143,24 +161,16 @@ func (r *Recorder) saveState(seq int, prev string) {
 	_ = os.WriteFile(r.statePath, b, 0o600)
 }
 
-// Add records a decision. Denies/redacts are always queued; repeated identical
-// allows are collapsed within the flush window to avoid flooding the CP.
+// Add records a proxy (MITM egress) decision. Denies/redacts are always queued;
+// repeated identical allows are collapsed within the flush window to avoid
+// flooding the CP.
 func (r *Recorder) Add(method, host, path, decision, policyID, reason, redactions string, enforced bool, latencyMs int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.total++
-	if decision == "deny" {
-		r.denies++
-	}
-
-	if decision == "allow" {
-		sig := method + " " + host + path
-		if _, seen := r.sampled[sig]; seen {
-			r.sampled[sig]++
-			return
-		}
-		r.sampled[sig] = 1
+	if decision == "allow" && r.collapse(method, host, path) {
+		r.total++
+		return
 	}
 
 	// Enforce the backlog cap before touching the chain. Dropping here - after
@@ -171,9 +181,7 @@ func (r *Recorder) Add(method, host, path, decision, policyID, reason, redaction
 		return
 	}
 
-	r.seq++
-	rec := Record{
-		Seq:        r.seq,
+	r.chain(Record{
 		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
 		Method:     method,
 		Path:       path,
@@ -188,8 +196,57 @@ func (r *Recorder) Add(method, host, path, decision, policyID, reason, redaction
 		Surface:    "egress",
 		EntityID:   r.entityID,
 		Direction:  "egress",
-		PrevHash:   r.prev,
+		Origin:     OriginProxy,
+	})
+}
+
+// AddGoverned records a runtime PDP decision. The caller supplies a Record with
+// its governance metadata (caller_*, surface, phase) already set; this stamps
+// the writer-owned fields (seq, prev/row hash, dp/entity, origin) and queues it.
+// The metadata fields are NOT hashed, so the row_hash matches the proxy path's
+// for an equivalent core decision.
+func (r *Recorder) AddGoverned(rec Record) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	rec.ReplicaID = r.dpID
+	rec.EntityID = r.entityID
+	rec.Origin = OriginRuntime
+	if rec.Direction == "" {
+		rec.Direction = rec.Surface
 	}
+	if len(r.pending) >= maxPending {
+		r.dropped++
+		return
+	}
+	r.chain(rec)
+}
+
+// collapse reports whether an allow with this signature has already been queued
+// in the current flush window (caller holds the lock). It updates the sample
+// counter as a side effect.
+func (r *Recorder) collapse(method, host, path string) bool {
+	sig := method + " " + host + path
+	if _, seen := r.sampled[sig]; seen {
+		r.sampled[sig]++
+		return true
+	}
+	r.sampled[sig] = 1
+	return false
+}
+
+// chain stamps the seq + hash-chain linkage onto rec and appends it (caller
+// holds the lock). The row_hash inputs are fixed and must stay byte-identical
+// across the proxy and runtime paths - governance metadata on rec is not hashed.
+func (r *Recorder) chain(rec Record) {
+	r.total++
+	if rec.Decision == "deny" {
+		r.denies++
+	}
+
+	r.seq++
+	rec.Seq = r.seq
+	rec.PrevHash = r.prev
 	rec.RowHash = rowHash(map[string]any{
 		"seq": rec.Seq, "timestamp": rec.Timestamp, "direction": rec.Direction,
 		"surface": rec.Surface, "entity_id": rec.EntityID, "jsonrpc_method": nil,

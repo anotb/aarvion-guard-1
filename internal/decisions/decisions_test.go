@@ -186,3 +186,73 @@ func TestAddAtCapDropsNewestAndKeepsChainContiguous(t *testing.T) {
 func pathN(i int) string {
 	return "/p/" + strconv.Itoa(i)
 }
+
+// The governance metadata fields (caller_*, phase, origin) are row metadata, not
+// hash inputs. Two rows with identical core fields must produce the SAME
+// row_hash whether or not the metadata is set, so the CP's linkage-only verify
+// and the Python DP shipper stay in lockstep. If this breaks, hashFields drifted.
+func TestGovernanceMetadataDoesNotChangeRowHash(t *testing.T) {
+	base := Record{
+		Timestamp: "2026-07-09T00:00:00Z",
+		Method:    "POST",
+		Host:      "api.example.com",
+		Path:      "/x",
+		Decision:  "deny",
+		Enforced:  true,
+		PolicyID:  "pol-1",
+		Reason:    "blocked",
+		Surface:   "send",
+	}
+
+	// Bare row: no governance metadata.
+	r1 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "a.json"))
+	bare := base
+	r1.AddGoverned(bare)
+	bareHash := r1.pending[0].RowHash
+
+	// Same core fields, but every governance metadata field populated.
+	r2 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "b.json"))
+	withMeta := base
+	withMeta.CallerPrincipalID = "principal-42"
+	withMeta.CallerSessionID = "session-99"
+	withMeta.CallerSource = "runtime"
+	withMeta.Phase = "pre"
+	r2.AddGoverned(withMeta)
+	metaHash := r2.pending[0].RowHash
+
+	if bareHash != metaHash {
+		t.Fatalf("governance metadata changed row_hash:\n bare=%s\n meta=%s", bareHash, metaHash)
+	}
+}
+
+// AddGoverned stamps Origin="runtime" and preserves the caller metadata on the
+// row, while the existing proxy Add path stays Origin="proxy".
+func TestOriginTagging(t *testing.T) {
+	r := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "o.json"))
+
+	r.Add("POST", "api.example.com", "/x", "deny", "pol", "r", "", true, 1)
+	if got := r.pending[0].Origin; got != OriginProxy {
+		t.Fatalf("proxy origin: got %q want %q", got, OriginProxy)
+	}
+
+	r.AddGoverned(Record{
+		Timestamp:         "2026-07-09T00:00:00Z",
+		Method:            "GET",
+		Host:              "api.example.com",
+		Path:              "/y",
+		Decision:          "allow",
+		Surface:           "egress",
+		CallerPrincipalID: "p1",
+	})
+	got := r.pending[1]
+	if got.Origin != OriginRuntime {
+		t.Fatalf("runtime origin: got %q want %q", got.Origin, OriginRuntime)
+	}
+	if got.CallerPrincipalID != "p1" {
+		t.Fatalf("caller metadata lost: got %q", got.CallerPrincipalID)
+	}
+	// The runtime row still links onto the proxy row's chain.
+	if got.PrevHash != r.pending[0].RowHash {
+		t.Fatalf("chain broken across paths: prev=%q want %q", got.PrevHash, r.pending[0].RowHash)
+	}
+}

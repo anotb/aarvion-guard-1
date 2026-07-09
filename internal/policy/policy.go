@@ -39,19 +39,54 @@ func New(opaAddr string) *Client {
 func (c *Client) Eval(ctx context.Context, method, host, path, body string, headers map[string]string) (*Decision, error) {
 	input := map[string]any{
 		"input": map[string]any{
-			"attributes": map[string]any{
-				"request": map[string]any{
-					"http": map[string]any{
-						"method":  method,
-						"host":    host,
-						"path":    path,
-						"body":    body,
-						"headers": headers,
-					},
-				},
+			"attributes": httpAttributes(method, host, path, body, headers),
+		},
+	}
+	return c.eval(ctx, input)
+}
+
+// GovernEval asks OPA to decide a runtime PDP request. It POSTs the full extended
+// input (ctx/caller/action plus the same attributes.request.http block Eval
+// sends) to the same entrypoint. OPA ignores unknown input fields, so existing
+// packs keep matching on the http block while caller/action become available for
+// future packs. The verdict maps allowed->allow, else deny.
+func (c *Client) GovernEval(ctx context.Context, input GovernInput) (*Decision, error) {
+	return c.eval(ctx, map[string]any{"input": input})
+}
+
+// GovernInput is the extended PDP evaluation input. The govern server builds it
+// from the incoming request; only attributes.request.http is consumed by today's
+// packs, the rest is forward-looking context.
+type GovernInput struct {
+	ContractVersion string         `json:"contract_version,omitempty"`
+	Ctx             map[string]any `json:"ctx,omitempty"`
+	Action          map[string]any `json:"action,omitempty"`
+	Attributes      map[string]any `json:"attributes,omitempty"`
+}
+
+// HTTPAttributes builds the attributes.request.http block shared by Eval and
+// GovernEval, so both paths present OPA an identical http shape.
+func HTTPAttributes(method, host, path, body string, headers map[string]string) map[string]any {
+	return httpAttributes(method, host, path, body, headers)
+}
+
+func httpAttributes(method, host, path, body string, headers map[string]string) map[string]any {
+	return map[string]any{
+		"request": map[string]any{
+			"http": map[string]any{
+				"method":  method,
+				"host":    host,
+				"path":    path,
+				"body":    body,
+				"headers": headers,
 			},
 		},
 	}
+}
+
+// eval marshals input, POSTs it to the shared entrypoint, and decodes the common
+// result.{allowed,http_status,headers} shape into a Decision.
+func (c *Client) eval(ctx context.Context, input map[string]any) (*Decision, error) {
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return nil, err

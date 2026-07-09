@@ -28,6 +28,26 @@ type Config struct {
 	PassthroughHosts []string `json:"passthrough_hosts,omitempty"`
 	EssentialHosts   []string `json:"essential_hosts,omitempty"`
 	Inspect          bool     `json:"inspect"`
+
+	Govern Govern `json:"govern,omitempty"`
+}
+
+// Govern configures the local Policy Decision Point: a Unix-socket server the
+// OpenClaw runtime calls (as a PEP) to approve each action before it runs. When
+// Socket.Path is empty the PDP is simply not started.
+type Govern struct {
+	Socket                GovernSocket      `json:"socket"`
+	FailMode              map[string]string `json:"fail_mode,omitempty"`
+	AllowCacheTTLMs       int               `json:"allow_cache_ttl_ms,omitempty"`
+	RateLimitPerCallerQPS int               `json:"rate_limit_per_caller_qps,omitempty"`
+}
+
+// GovernSocket is the PDP listener: a filesystem socket, a bearer token the PEP
+// must present, and the uid the connecting peer must run as.
+type GovernSocket struct {
+	Path    string `json:"path"`
+	Token   string `json:"token"`
+	PeerUID uint32 `json:"peer_uid"`
 }
 
 const (

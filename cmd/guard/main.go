@@ -20,8 +20,10 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/config"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
+	"github.com/aarvion-ai/aarvion-guard/internal/govern"
 	"github.com/aarvion-ai/aarvion-guard/internal/heartbeat"
 	"github.com/aarvion-ai/aarvion-guard/internal/intercept"
+	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/opa"
 	"github.com/aarvion-ai/aarvion-guard/internal/pair"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
@@ -261,6 +263,25 @@ func cmdRun() {
 
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
+
+	// The runtime PDP is optional: only start it when a socket is configured.
+	// It shares the policy client + recorder with the proxy, so both governance
+	// paths write to the same OPA and decision chain.
+	if cfg.Govern.Socket.Path != "" {
+		gsrv := govern.New(govern.Config{
+			SocketPath: cfg.Govern.Socket.Path,
+			Token:      cfg.Govern.Socket.Token,
+			PeerUID:    cfg.Govern.Socket.PeerUID,
+			FailMode:   cfg.Govern.FailMode,
+			Essential:  mitm.Essentials(essentialHosts(cfg)),
+		}, pol, rec)
+		go func() {
+			if err := gsrv.ListenAndServe(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "[govern] %v\n", err)
+			}
+		}()
+		fmt.Printf("govern PDP listening on %s (peer_uid=%d)\n", cfg.Govern.Socket.Path, cfg.Govern.Socket.PeerUID)
+	}
 
 	if cfg.Mode == config.ModeTransparent {
 		runTransparent(ctx, cfg, pol, rec)

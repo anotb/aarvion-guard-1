@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"container/list"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -16,15 +17,50 @@ import (
 	"time"
 )
 
+// leafCacheCap bounds how many minted leaf certs we keep. Without a bound a
+// transparent-mode client can walk distinct SNIs forever, forcing a fresh
+// ECDSA keygen plus unbounded map growth per name (memory + CPU DoS). The cache
+// is an LRU: once full, minting a new leaf evicts the least-recently-used one.
+const leafCacheCap = 1024
+
+// leafEntry is the value carried by each LRU list element. We keep host so an
+// eviction from the back of the list can delete the matching map key.
+type leafEntry struct {
+	host string
+	leaf *tls.Certificate
+}
+
 // CA is a machine-local certificate authority. Its private key never leaves the
 // box (locked decision §12.3) — it is only ever used to mint short leaf certs
 // on the fly for hosts the guard inspects.
 type CA struct {
-	cert   *x509.Certificate
-	key    *ecdsa.PrivateKey
-	caPEM  []byte
-	mu     sync.Mutex
-	leaves map[string]*tls.Certificate
+	cert  *x509.Certificate
+	key   *ecdsa.PrivateKey
+	caPEM []byte
+
+	mu sync.Mutex
+	// leaves indexes SNI -> *list.Element for O(1) lookup; lru orders those
+	// elements most-recently-used (front) to least (back). Both are guarded
+	// by mu and stay in lock-step.
+	leaves map[string]*list.Element
+	lru    *list.List
+	// leafCap is the LRU capacity; 0 means use leafCacheCap. It exists so tests
+	// can drive eviction without minting thousands of real ECDSA leaves.
+	leafCap int
+}
+
+// cap returns the effective LRU capacity. Callers hold c.mu.
+func (c *CA) cap() int {
+	if c.leafCap > 0 {
+		return c.leafCap
+	}
+	return leafCacheCap
+}
+
+// newLeafCache builds an empty bounded leaf cache. Every CA constructor uses it
+// so leaves/lru are never nil.
+func newLeafCache() (map[string]*list.Element, *list.List) {
+	return make(map[string]*list.Element), list.New()
 }
 
 func EnsureCA(dir string) (*CA, error) {
@@ -52,7 +88,8 @@ func EnsureCA(dir string) (*CA, error) {
 	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
 		return nil, err
 	}
-	return &CA{cert: cert, key: key, caPEM: certPEM, leaves: map[string]*tls.Certificate{}}, nil
+	leaves, lru := newLeafCache()
+	return &CA{cert: cert, key: key, caPEM: certPEM, leaves: leaves, lru: lru}, nil
 }
 
 func generate() (*x509.Certificate, *ecdsa.PrivateKey, []byte, []byte, error) {
@@ -102,7 +139,8 @@ func load(certPEM, keyPEM []byte) (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CA{cert: cert, key: key, caPEM: certPEM, leaves: map[string]*tls.Certificate{}}, nil
+	leaves, lru := newLeafCache()
+	return &CA{cert: cert, key: key, caPEM: certPEM, leaves: leaves, lru: lru}, nil
 }
 
 // CertPEM returns the CA cert to add to a trust store.
@@ -117,8 +155,10 @@ func (c *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if leaf, ok := c.leaves[host]; ok {
-		return leaf, nil
+	if el, ok := c.leaves[host]; ok {
+		// Cache hit: promote to most-recently-used and hand back the leaf.
+		c.lru.MoveToFront(el)
+		return el.Value.(*leafEntry).leaf, nil
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -143,6 +183,16 @@ func (c *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error
 		Certificate: [][]byte{der, c.cert.Raw},
 		PrivateKey:  key,
 	}
-	c.leaves[host] = leaf
+	// Insert at the front (most-recently-used) and evict from the back until we
+	// are back within capacity.
+	c.leaves[host] = c.lru.PushFront(&leafEntry{host: host, leaf: leaf})
+	for c.lru.Len() > c.cap() {
+		oldest := c.lru.Back()
+		if oldest == nil {
+			break
+		}
+		c.lru.Remove(oldest)
+		delete(c.leaves, oldest.Value.(*leafEntry).host)
+	}
 	return leaf, nil
 }

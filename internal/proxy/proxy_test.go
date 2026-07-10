@@ -62,7 +62,7 @@ func newGuard(t *testing.T, addr string, passthrough []string) (*decisions.Recor
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, passthrough, true, nil, mitm.Allowlist{}, nil)
+	srv := New(addr, authority, pol, rec, nil, passthrough, true, nil, mitm.Allowlist{}, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
@@ -87,7 +87,7 @@ func newRateLimitedGuard(t *testing.T, addr string, limiter *ratelimit.Limiter) 
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, nil, true, limiter, mitm.Allowlist{}, nil)
+	srv := New(addr, authority, pol, rec, nil, nil, true, limiter, mitm.Allowlist{}, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()
@@ -190,7 +190,7 @@ func newAllowlistGuard(t *testing.T, addr string, allowlist mitm.Allowlist) *dec
 	}
 	pol := policy.New(strings.TrimPrefix(opa.URL, "http://"))
 	rec := decisions.New("http://cp.invalid", "t", "e", "tok", "dp", "")
-	srv := New(addr, authority, pol, rec, nil, nil, true, nil, allowlist, nil)
+	srv := New(addr, authority, pol, rec, nil, nil, true, nil, allowlist, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.ListenAndServe(ctx) }()

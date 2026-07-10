@@ -16,6 +16,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
 
@@ -362,5 +363,79 @@ func TestFailModeNonEssentialReadDenies(t *testing.T) {
 	out := decode(t, resp)
 	if out.Verdict != VerdictDeny {
 		t.Fatalf("non-essential read: got %q want deny", out.Verdict)
+	}
+}
+
+// testOverlay builds an in-memory tighten-only overlay store from the given rules.
+func testOverlay(t *testing.T, rules ...overlay.Rule) *overlay.Store {
+	t.Helper()
+	st, err := overlay.Load(filepath.Join(t.TempDir(), "overlay.json"))
+	if err != nil {
+		t.Fatalf("overlay load: %v", err)
+	}
+	if err := st.Replace(rules); err != nil {
+		t.Fatalf("overlay replace: %v", err)
+	}
+	return st
+}
+
+// A tighten-only overlay deny rule turns a base ALLOW into a deny on the PDP path.
+func TestOverlayTightensAllowToDeny(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "blk-host",
+		Verdict: overlay.VerdictDeny,
+		Reason:  "blocked by local overlay",
+		Enabled: true,
+		Match:   overlay.Match{HostSuffixes: []string{"blocked.example.com"}},
+	})
+	client, sock := startServer(t, Config{Overlay: ov}, opaStub(t, true))
+
+	resp := post(t, client, sock, testToken, sampleRequest("n-ov-deny", "POST", "blocked.example.com"))
+	out := decode(t, resp)
+	if out.Verdict != VerdictDeny {
+		t.Fatalf("verdict: got %q want deny", out.Verdict)
+	}
+
+	// A host the rule doesn't match stays on the base allow.
+	resp = post(t, client, sock, testToken, sampleRequest("n-ov-allow", "POST", "fine.example.com"))
+	if out := decode(t, resp); out.Verdict != VerdictAllow {
+		t.Fatalf("non-matching host: got %q want allow", out.Verdict)
+	}
+}
+
+// A tighten-only overlay ask rule escalates a base ALLOW to human approval. Unlike
+// egress, the PDP supports "ask", so it stays an ask (not a deny).
+func TestOverlayEscalatesAllowToAsk(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "ask-host",
+		Verdict: overlay.VerdictAsk,
+		Reason:  "needs owner approval",
+		Enabled: true,
+		Match:   overlay.Match{HostSuffixes: []string{"review.example.com"}},
+	})
+	client, sock := startServer(t, Config{Overlay: ov}, opaStub(t, true))
+
+	resp := post(t, client, sock, testToken, sampleRequest("n-ov-ask", "POST", "review.example.com"))
+	out := decode(t, resp)
+	if out.Verdict != VerdictAsk {
+		t.Fatalf("verdict: got %q want ask", out.Verdict)
+	}
+}
+
+// The overlay is tighten-only: when the base policy DENIES, a matching overlay
+// rule must not be consulted and can never loosen the deny.
+func TestOverlayNeverLoosensBaseDeny(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "would-ask",
+		Verdict: overlay.VerdictAsk,
+		Reason:  "irrelevant on a base deny",
+		Enabled: true,
+		Match:   overlay.Match{HostSuffixes: []string{"blocked.example.com"}},
+	})
+	client, sock := startServer(t, Config{Overlay: ov}, opaStub(t, false))
+
+	resp := post(t, client, sock, testToken, sampleRequest("n-ov-basedeny", "POST", "blocked.example.com"))
+	if out := decode(t, resp); out.Verdict != VerdictDeny {
+		t.Fatalf("base deny must stand: got %q want deny", out.Verdict)
 	}
 }

@@ -1,0 +1,191 @@
+<!-- Aarvion local console. Served at / by a Go http.FileServer over go:embed.
+     No build step, no external CDNs/fonts/frameworks. Everything self-contained. -->
+<title>Aarvion · local console</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<link rel="stylesheet" href="styles.css" />
+
+<a class="skip" href="#feed">Skip to decisions</a>
+
+<header class="topbar" role="banner">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">Aarvion</span>
+    <span class="brand-sep" aria-hidden="true">·</span>
+    <span class="brand-sub">local console</span>
+  </div>
+
+  <div class="ident" id="ident">
+    <div class="ident-field">
+      <span class="ident-label">entity</span>
+      <span class="ident-value" id="entityId">—</span>
+    </div>
+    <div class="ident-field">
+      <span class="ident-label">tenant</span>
+      <span class="ident-value" id="tenant">—</span>
+    </div>
+  </div>
+
+  <div class="sync">
+    <button id="syncNow" class="btn btn-quiet" type="button" title="Reconcile with the cloud now">
+      Sync now
+    </button>
+    <span id="syncPill" class="pill pill-unknown" role="status" aria-live="polite">
+      <span class="pill-dot" aria-hidden="true"></span>
+      <span class="pill-text">Unknown</span>
+    </span>
+  </div>
+</header>
+
+<!-- Shown only when the page was opened without a ?t=<token>. -->
+<div id="tokenNotice" class="notice notice-hidden" role="alert" hidden>
+  <span class="notice-key">no token</span>
+  <span class="notice-body">
+    This console is authenticated. Open it from
+    <code>aarvion-guard dashboard</code> so it launches with your access token.
+  </span>
+</div>
+
+<main class="wrap">
+
+  <!-- 1) LIVE DECISIONS FEED ------------------------------------------------ -->
+  <section class="panel" id="feed" aria-labelledby="feed-h">
+    <div class="panel-head">
+      <div class="panel-title">
+        <h2 id="feed-h">Live decisions</h2>
+        <span class="panel-note" id="feedMeta">last 100 · refreshing every 4s</span>
+      </div>
+      <div class="panel-tools">
+        <span class="live" id="liveDot" title="Auto-refreshing">
+          <span class="live-dot" aria-hidden="true"></span> live
+        </span>
+      </div>
+    </div>
+
+    <div class="table-scroll">
+      <table class="feed-table">
+        <thead>
+          <tr>
+            <th class="col-time">time</th>
+            <th class="col-surface">surface</th>
+            <th class="col-decision">decision</th>
+            <th class="col-reason">reason</th>
+            <th class="col-caller">caller</th>
+          </tr>
+        </thead>
+        <tbody id="feedBody">
+          <!-- rows injected by app.js -->
+        </tbody>
+      </table>
+    </div>
+
+    <div class="state state-loading" id="feedLoading">
+      <span class="spinner" aria-hidden="true"></span> Loading decisions…
+    </div>
+    <div class="state state-empty" id="feedEmpty" hidden>
+      No decisions yet. They appear here as the guard judges egress.
+    </div>
+    <div class="state state-error" id="feedError" hidden></div>
+  </section>
+
+  <!-- 2) LOCAL OVERLAY EDITOR ----------------------------------------------- -->
+  <section class="panel" id="overlay" aria-labelledby="overlay-h">
+    <div class="panel-head">
+      <div class="panel-title">
+        <h2 id="overlay-h">Local overlay</h2>
+        <span class="panel-note">tighten-only rules, applied on top of cloud policy</span>
+      </div>
+      <div class="panel-tools">
+        <button id="addRule" class="btn btn-quiet" type="button">Add rule</button>
+        <button id="saveOverlay" class="btn btn-accent" type="button">Save overlay</button>
+      </div>
+    </div>
+
+    <p class="overlay-guardrail">
+      Overlay rules only make policy <strong>stricter</strong> (deny / ask) — never looser.
+      Loosening is done in the cloud dashboard.
+    </p>
+
+    <div id="overlayError" class="state state-error" hidden></div>
+    <div id="overlaySaved" class="state state-ok" hidden>Overlay saved.</div>
+
+    <div class="state state-loading" id="overlayLoading">
+      <span class="spinner" aria-hidden="true"></span> Loading overlay…
+    </div>
+    <div class="state state-empty" id="overlayEmpty" hidden>
+      No local rules. Add one to tighten policy on this machine.
+    </div>
+
+    <div id="ruleList" class="rule-list" role="list"><!-- rule cards injected --></div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span class="foot-item">served locally by the guard</span>
+  <span class="foot-sep" aria-hidden="true">·</span>
+  <span class="foot-item">offline · no external calls</span>
+</footer>
+
+<!-- Hidden template for one overlay rule card, cloned per rule in app.js. -->
+<template id="ruleTpl">
+  <div class="rule" role="listitem">
+    <div class="rule-bar" data-role="bar" aria-hidden="true"></div>
+    <div class="rule-body">
+      <div class="rule-row rule-row-top">
+        <label class="field field-desc">
+          <span class="field-label">description</span>
+          <input type="text" data-field="description" placeholder="e.g. block prod database writes" />
+        </label>
+        <label class="field field-verdict">
+          <span class="field-label">verdict</span>
+          <select data-field="verdict">
+            <option value="deny">deny</option>
+            <option value="ask">ask</option>
+          </select>
+        </label>
+        <label class="field field-enabled">
+          <span class="field-label">enabled</span>
+          <button type="button" class="toggle" data-field="enabled" role="switch" aria-checked="true">
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-text">on</span>
+          </button>
+        </label>
+        <button type="button" class="btn btn-ghost rule-delete" data-action="delete" title="Delete rule">
+          Delete
+        </button>
+      </div>
+
+      <div class="rule-row rule-row-match">
+        <label class="field">
+          <span class="field-label">match · tools</span>
+          <input type="text" data-field="tools" placeholder="bash, http_request" />
+        </label>
+        <label class="field">
+          <span class="field-label">match · command contains</span>
+          <input type="text" data-field="command_contains" placeholder="rm -rf, DROP TABLE" />
+        </label>
+        <label class="field">
+          <span class="field-label">match · host suffixes</span>
+          <input type="text" data-field="host_suffixes" placeholder="internal.corp, example.com" />
+        </label>
+        <label class="field">
+          <span class="field-label">match · methods</span>
+          <input type="text" data-field="methods" placeholder="POST, DELETE" />
+        </label>
+      </div>
+
+      <div class="rule-row rule-row-reason">
+        <label class="field field-reason">
+          <span class="field-label">reason</span>
+          <input type="text" data-field="reason" placeholder="shown to the caller when this rule fires" />
+        </label>
+      </div>
+
+      <p class="rule-err" data-role="err" hidden></p>
+    </div>
+  </div>
+</template>
+
+<script src="app.js"></script>

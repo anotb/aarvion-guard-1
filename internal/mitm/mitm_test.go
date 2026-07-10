@@ -7,12 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
@@ -497,5 +499,55 @@ func TestHeaderMapLowercasesAndJoins(t *testing.T) {
 	}
 	if m["x-multi"] != "a,b" {
 		t.Fatalf("x-multi = %q, want a,b", m["x-multi"])
+	}
+}
+
+func mkOverlay(t *testing.T, rules ...overlay.Rule) *overlay.Store {
+	t.Helper()
+	st, err := overlay.Load(filepath.Join(t.TempDir(), "overlay.json"))
+	if err != nil {
+		t.Fatalf("overlay load: %v", err)
+	}
+	if err := st.Replace(rules); err != nil {
+		t.Fatalf("overlay replace: %v", err)
+	}
+	return st
+}
+
+// A tighten-only overlay rule turns an OPA-allowed egress request into a deny,
+// and leaves non-matching hosts on the base allow.
+func TestDecideOverlayTightensAllowToDeny(t *testing.T) {
+	ov := mkOverlay(t, overlay.Rule{
+		ID:      "blk-egress",
+		Verdict: overlay.VerdictDeny,
+		Reason:  "blocked by local overlay",
+		Enabled: true,
+		Match:   overlay.Match{HostSuffixes: []string{"blocked.example"}},
+	})
+	opa := allowAllOPA(t)
+	d := Deps{Pol: policy.New(strings.TrimPrefix(opa.URL, "http://")), Overlay: ov}
+
+	dec := d.Decide("GET", "blocked.example", "/", "", nil)
+	if dec.Allowed {
+		t.Fatalf("overlay deny: got allowed, want denied")
+	}
+	if !strings.HasPrefix(dec.Reason, "local_overlay:") {
+		t.Fatalf("reason = %q, want local_overlay: prefix", dec.Reason)
+	}
+	if dec.PolicyID != "blk-egress" {
+		t.Fatalf("policy id = %q, want blk-egress", dec.PolicyID)
+	}
+
+	if dec := d.Decide("GET", "fine.example", "/", "", nil); !dec.Allowed {
+		t.Fatalf("non-matching host: got denied (%q), want allowed", dec.Reason)
+	}
+}
+
+// A nil overlay preserves the pre-feature behavior exactly: OPA's allow stands.
+func TestDecideNilOverlayUnchanged(t *testing.T) {
+	opa := allowAllOPA(t)
+	d := Deps{Pol: policy.New(strings.TrimPrefix(opa.URL, "http://"))}
+	if dec := d.Decide("GET", "anything.example", "/", "", nil); !dec.Allowed {
+		t.Fatalf("nil overlay must not deny: got %q", dec.Reason)
 	}
 }

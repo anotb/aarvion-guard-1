@@ -15,6 +15,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/control"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
@@ -35,14 +36,14 @@ type Server struct {
 	blocked map[string]bool
 }
 
-func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool, limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller) *Server {
+func New(addr string, authority *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential, passthrough []string, inspect bool, limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller, ov *overlay.Store) *Server {
 	pt := map[string]bool{}
 	for _, h := range passthrough {
 		pt[strings.ToLower(h)] = true
 	}
 	return &Server{
 		addr:        addr,
-		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist, Control: ctrl},
+		deps:        mitm.Deps{CA: authority, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist, Control: ctrl, Overlay: ov},
 		passthrough: pt,
 		inspect:     inspect,
 		transport:   &http.Transport{Proxy: nil},

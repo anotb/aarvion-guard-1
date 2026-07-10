@@ -14,6 +14,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/control"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
 )
@@ -44,6 +45,13 @@ type Deps struct {
 	// value (mode "") disables gating entirely and preserves the pre-feature
 	// behavior exactly.
 	Allowlist Allowlist
+
+	// Overlay is an optional tighten-only local override set (see internal/overlay).
+	// It's consulted ONLY after the base OPA decision ALLOWS a request, and can only
+	// escalate an allow to a deny — never loosen a CP-signed deny — so operators can
+	// tighten local posture between policy syncs without weakening the signed policy.
+	// A nil Overlay disables it entirely and preserves the pre-feature behavior.
+	Overlay *overlay.Store
 
 	// Control is an optional file-driven emergency lever set: kill-switch (freeze)
 	// and break-glass. It's checked as the VERY FIRST thing in Decide, ahead of
@@ -254,6 +262,14 @@ func (d Deps) Decide(method, host, path, body string, headers map[string]string)
 		// OPA's reason — the operator already sees the deny.
 		if novel && dec.Allowed {
 			dec.Reason = "novel_host_observed"
+		}
+		// Tighten-only local overlay: only consulted on an allow, and can only turn
+		// it into a deny. Egress can't pause for approval, so an "ask" rule is
+		// enforced as a deny here (still strictly a tightening).
+		if dec.Allowed && d.Overlay != nil {
+			if r, ok := d.Overlay.Match(overlay.Action{Host: host, Method: method, Path: path, Surface: "egress"}); ok {
+				return &policy.Decision{Allowed: false, HTTPStatus: http.StatusForbidden, PolicyID: r.ID, Reason: "local_overlay: " + r.Reason, Enforced: true}
+			}
 		}
 		return dec
 	}

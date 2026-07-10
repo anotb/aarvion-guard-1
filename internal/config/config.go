@@ -35,6 +35,22 @@ type Config struct {
 	Allowlist     Allowlist     `json:"allowlist,omitempty"`
 	Learn         Learn         `json:"learn,omitempty"`
 	Control       Control       `json:"control,omitempty"`
+	Console       Console       `json:"console,omitempty"`
+}
+
+// Console configures the local governance dashboard: a loopback-only HTTP UI for
+// viewing the live decision feed and authoring tighten-only local overlay rules
+// (which sync up to the control plane). It binds 127.0.0.1 only and gates its API
+// with a random per-run bearer token written to ~/.aarvion/console-token, so only
+// a local process that can read that file (the same user) can mutate the overlay.
+//
+//   - Enabled: when false (or the struct is absent) no console is served and there
+//     is zero overhead. Defaulted on by `init`/`onboard`; safe because it's
+//     loopback + token gated.
+//   - Addr: listen address (default 127.0.0.1:8790). Must stay on loopback.
+type Console struct {
+	Enabled bool   `json:"enabled"`
+	Addr    string `json:"addr,omitempty"`
 }
 
 // Control configures the two file-driven emergency levers a fleet operator pulls
@@ -153,6 +169,9 @@ const (
 
 	DefaultGuardGroup      = "aarvionguard"
 	DefaultTransparentAddr = ":8898"
+	// DefaultConsoleAddr is the loopback bind for the local governance console,
+	// used when console.addr is unset. Loopback-only by design.
+	DefaultConsoleAddr = "127.0.0.1:8790"
 )
 
 func CADir() string { return filepath.Join(Dir(), "ca") }
@@ -183,6 +202,18 @@ func FreezePath() string { return filepath.Join(Dir(), "freeze") }
 // BreakGlassPath is the default break-glass control file, used when
 // control.break_glass_file is unset. Its presence opens a time-boxed bypass.
 func BreakGlassPath() string { return filepath.Join(Dir(), "breakglass") }
+
+// OverlayPath persists the tighten-only local overlay rules the console edits and
+// the decision path enforces.
+func OverlayPath() string { return filepath.Join(Dir(), "overlay.json") }
+
+// ConsoleTokenPath holds the random bearer token the console API requires; the
+// `dashboard` command reads it to open the browser pre-authenticated. 0600.
+func ConsoleTokenPath() string { return filepath.Join(Dir(), "console-token") }
+
+// DecisionsLogPath is the default local decision log the console's live feed
+// tails, used when console is enabled but no audit_jsonl_path is configured.
+func DecisionsLogPath() string { return filepath.Join(Dir(), "decisions.jsonl") }
 
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())

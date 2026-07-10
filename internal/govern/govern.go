@@ -22,6 +22,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
 
@@ -57,6 +58,12 @@ type Config struct {
 	PeerUID    uint32
 	FailMode   map[string]string
 	Essential  mitm.EssentialSet
+
+	// Overlay is an optional tighten-only local override set. On the PDP path it's
+	// consulted only when the base policy ALLOWED the action, and can escalate to
+	// "ask" (human approval) or "deny" — but never loosen a CP-signed deny. A nil
+	// Overlay disables it. See internal/overlay.
+	Overlay *overlay.Store
 }
 
 // Server is the PDP. It owns the socket lifecycle and delegates decisions to OPA
@@ -206,6 +213,22 @@ func (s *Server) handleGovern(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// commandString renders an action's args into a single searchable haystack for
+// the overlay's CommandContains facet. A string arg is used verbatim; anything
+// else is JSON-encoded so a rule matching "rm -rf" fires whether the runtime sent
+// {"cmd":"rm -rf /"} or ["rm","-rf","/"]. Falls back to the operation name.
+func commandString(a Action) string {
+	if s, ok := a.Args.(string); ok {
+		return s
+	}
+	if a.Args != nil {
+		if b, err := json.Marshal(a.Args); err == nil {
+			return string(b)
+		}
+	}
+	return a.Operation
+}
+
 // decide evaluates OPA (with the fail-mode fallback) and records the decision.
 func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	start := s.nowFn()
@@ -214,6 +237,30 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	dec, err := s.pol.GovernEval(ctx, s.buildInput(req))
 	if err != nil {
 		dec = s.failMode(req)
+	}
+
+	// Tighten-only local overlay: consulted only when the base policy ALLOWED the
+	// action. It can escalate an allow to "ask" (owner approval) or "deny" but can
+	// never loosen a signed deny, so local rules only ever add friction. Unlike the
+	// egress path, the PDP supports "ask", so an ask rule stays an ask here.
+	if dec.Allowed && s.cfg.Overlay != nil {
+		act := overlay.Action{
+			Tool:    req.Action.Tool,
+			Command: commandString(req.Action),
+			Host:    hreq.Host,
+			Method:  hreq.Method,
+			Path:    hreq.Path,
+			Surface: req.Ctx.Surface,
+		}
+		if r, ok := s.cfg.Overlay.Match(act); ok {
+			dec.PolicyID = r.ID
+			dec.Reason = "local_overlay: " + r.Reason
+			if r.Verdict == overlay.VerdictAsk {
+				dec.Verdict = VerdictAsk
+			} else {
+				dec.Allowed = false
+			}
+		}
 	}
 	latency := int(s.nowFn().Sub(start).Milliseconds())
 

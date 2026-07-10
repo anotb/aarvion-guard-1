@@ -20,13 +20,16 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/config"
+	"github.com/aarvion-ai/aarvion-guard/internal/console"
 	"github.com/aarvion-ai/aarvion-guard/internal/control"
+	"github.com/aarvion-ai/aarvion-guard/internal/cpsync"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/govern"
 	"github.com/aarvion-ai/aarvion-guard/internal/heartbeat"
 	"github.com/aarvion-ai/aarvion-guard/internal/intercept"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/opa"
+	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/pair"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/proxy"
@@ -133,6 +136,8 @@ func main() {
 		cmdOnboard(os.Args[2:])
 	case "run":
 		cmdRun()
+	case "dashboard":
+		cmdDashboard(os.Args[2:])
 	case "exec":
 		cmdExec(os.Args[2:])
 	case "service":
@@ -160,6 +165,7 @@ usage:
   aarvion-guard onboard <pairing-code>    # one-command: pair + guard + plugin + govern OpenClaw
   aarvion-guard init <pairing-code> [--api URL] [--device NAME] [--transparent]
   aarvion-guard run                       # start the guard (root for --transparent)
+  aarvion-guard dashboard                 # open the local governance console in your browser
   aarvion-guard exec -- <cmd...>          # run OpenClaw inside the governed group
   aarvion-guard service install|uninstall # run the guard as a background service
   aarvion-guard update                    # swap in a new binary, keep the pairing
@@ -228,6 +234,9 @@ func cmdInit(args []string) {
 		GuardGroup:      config.DefaultGuardGroup,
 		OPAAddr:         defaultOPAAddr,
 		Inspect:         !*noInspect,
+		// Loopback governance console on by default: safe (127.0.0.1 + token gate)
+		// and the primary way an operator authors tighten-only local overlay rules.
+		Console: config.Console{Enabled: true},
 	}
 	if err := cfg.Save(); err != nil {
 		fatal(err)
@@ -335,7 +344,13 @@ func cmdOnboard(args []string) {
 			GuardGroup:      config.DefaultGuardGroup,
 			OPAAddr:         defaultOPAAddr,
 			Inspect:         !*noInspect,
+			Console:         config.Console{Enabled: true},
 		}
+	}
+	// Ensure the loopback console is on even when reusing an existing pairing, so an
+	// upgrade lights up the dashboard + overlay editor without a re-pair.
+	if !cfg.Console.Enabled {
+		cfg.Console.Enabled = true
 	}
 
 	// Provision the govern PDP socket so the plugin has an endpoint to call.
@@ -473,6 +488,129 @@ func restartOpenClawGateway() {
 	fmt.Println("restarted the OpenClaw gateway")
 }
 
+// loadOverlay opens the tighten-only local overlay store, tolerating a missing
+// file (an empty store). A hard load error (malformed JSON) is logged and
+// disables the overlay rather than blocking guard startup.
+func loadOverlay() *overlay.Store {
+	st, err := overlay.Load(config.OverlayPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[overlay] disabled: %v\n", err)
+		return nil
+	}
+	return st
+}
+
+// reloadOverlay re-reads overlay.json on a ticker so out-of-band edits (a hand
+// edit, or a future cloud pull) are picked up without a restart. Console edits
+// already update the shared in-memory store; this only covers external writers.
+func reloadOverlay(ctx context.Context, ov *overlay.Store) {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := ov.Reload(); err != nil {
+				fmt.Fprintf(os.Stderr, "[overlay] reload: %v\n", err)
+			}
+		}
+	}
+}
+
+// startConsole serves the loopback governance console (live feed + tighten-only
+// overlay editor) when enabled. It mints a fresh bearer token per run, writes it
+// 0600 so `dashboard` can open the browser pre-authed, and wires the shared
+// overlay store plus a control-plane sync adapter. Loopback bind + token gate
+// means only the same local user can reach it. No-op when console is disabled.
+func startConsole(ctx context.Context, cfg *config.Config, ov *overlay.Store) {
+	if !cfg.Console.Enabled {
+		return
+	}
+	addr := cfg.Console.Addr
+	if addr == "" {
+		addr = config.DefaultConsoleAddr
+	}
+	token := randomSecret()
+	if err := os.WriteFile(config.ConsoleTokenPath(), []byte(token), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "[console] disabled: cannot write token: %v\n", err)
+		return
+	}
+	var cp console.CP
+	if cfg.CPUrl != "" {
+		cp = consoleCP{cpsync.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken)}
+	}
+	srv := console.New(console.Config{
+		Addr:     addr,
+		Token:    token,
+		FeedPath: cfg.Observability.AuditJSONLPath,
+		Entity:   cfg.EntityID,
+		Tenant:   cfg.Tenant,
+		Overlay:  ov,
+		CP:       cp,
+	})
+	go func() {
+		if err := srv.ListenAndServe(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "[console] %v\n", err)
+		}
+	}()
+	fmt.Printf("governance console on http://%s (run `%s dashboard` to open)\n", addr, guardCmd())
+}
+
+// consoleCP adapts a *cpsync.Client to the console.CP interface. The two Status
+// types are structurally identical but nominally distinct across packages, so the
+// console keeps its own dependency-free contract and main bridges the two.
+type consoleCP struct{ c *cpsync.Client }
+
+func (a consoleCP) Status(ctx context.Context) (console.SyncStatus, error) {
+	s, err := a.c.Status(ctx)
+	return console.SyncStatus{State: s.State, Pending: s.Pending}, err
+}
+
+func (a consoleCP) PushOverlay(ctx context.Context, rules []overlay.Rule) error {
+	return a.c.PushOverlay(ctx, rules)
+}
+
+// cmdDashboard opens the local governance console in the default browser using
+// the per-run bearer token the running guard wrote. It starts nothing; the guard
+// (`run`/`service`) serves the console.
+func cmdDashboard(_ []string) {
+	cfg, err := config.Load()
+	if err != nil {
+		fatal(err)
+	}
+	if !cfg.Console.Enabled {
+		fmt.Fprintln(os.Stderr, "the governance console is disabled (set console.enabled in guard.json, then restart the guard)")
+		os.Exit(1)
+	}
+	tok, err := os.ReadFile(config.ConsoleTokenPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "console not running — start the guard first (%s run, or %s service install)\n", guardCmd(), guardCmd())
+		os.Exit(1)
+	}
+	addr := cfg.Console.Addr
+	if addr == "" {
+		addr = config.DefaultConsoleAddr
+	}
+	url := fmt.Sprintf("http://%s/?t=%s", addr, strings.TrimSpace(string(tok)))
+	fmt.Printf("opening the governance console: %s\n", url)
+	if err := openURL(url); err != nil {
+		fmt.Printf("could not open a browser automatically — paste this in yours:\n  %s\n", url)
+	}
+}
+
+// openURL opens a URL in the platform's default browser (best-effort, detached).
+func openURL(url string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", url).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	default:
+		return exec.Command("xdg-open", url).Start()
+	}
+}
+
 func cmdRun() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -481,6 +619,22 @@ func cmdRun() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Tighten-only local overlay, shared by every decision path (proxy, transparent,
+	// PDP) and the console editor, so a rule authored in the UI takes effect
+	// in-process immediately. loadOverlay tolerates a missing file (empty store); a
+	// background reloader also picks up out-of-band edits to overlay.json.
+	ov := loadOverlay()
+	if ov != nil {
+		go reloadOverlay(ctx, ov)
+	}
+
+	// When the console is enabled but no audit sink is configured, default one so the
+	// console's live feed has a decision log to tail. Additive: the JSONL sink is the
+	// feed source, so this must be set before attachSinks builds the sinks.
+	if cfg.Console.Enabled && cfg.Observability.AuditJSONLPath == "" {
+		cfg.Observability.AuditJSONLPath = config.DecisionsLogPath()
+	}
 
 	if _, err := opa.EnsureBinary(ctx); err != nil {
 		fatal(fmt.Errorf("policy engine: %w", err))
@@ -508,6 +662,10 @@ func cmdRun() {
 	// when its config field is set); closeSinks flushes them on shutdown.
 	closeSinks := attachSinks(ctx, cfg, rec)
 	defer closeSinks()
+
+	// Loopback governance console: live decision feed + tighten-only overlay editor
+	// that syncs up to the control plane. Started once, independent of proxy mode.
+	startConsole(ctx, cfg, ov)
 
 	// Optional egress rate limiter: an in-memory, per-host ceiling checked before
 	// OPA. nil when rate_limit is disabled, which preserves the prior behavior.
@@ -554,6 +712,7 @@ func cmdRun() {
 			PeerUID:    cfg.Govern.Socket.PeerUID,
 			FailMode:   cfg.Govern.FailMode,
 			Essential:  mitm.Essentials(essentialHosts(cfg)),
+			Overlay:    ov,
 		}, pol, rec)
 		go func() {
 			if err := gsrv.ListenAndServe(ctx); err != nil {
@@ -564,7 +723,7 @@ func cmdRun() {
 	}
 
 	if cfg.Mode == config.ModeTransparent {
-		runTransparent(ctx, cfg, pol, rec, limiter, allowlist, ctrl)
+		runTransparent(ctx, cfg, pol, rec, limiter, allowlist, ctrl, ov)
 	} else {
 		var authority *ca.CA
 		if cfg.Inspect {
@@ -574,7 +733,7 @@ func cmdRun() {
 			}
 			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter, allowlist, ctrl)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter, allowlist, ctrl, ov)
 		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
@@ -583,7 +742,7 @@ func cmdRun() {
 	fmt.Println("guard stopped")
 }
 
-func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller) {
+func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller, ov *overlay.Store) {
 	gid, err := ensureGroup(cfg.GuardGroup)
 	if err != nil {
 		fatal(fmt.Errorf("group %q: %w (run with sudo)", cfg.GuardGroup, err))
@@ -607,7 +766,7 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	// OpenClaw's egress black-holed.
 	defer func() { _ = backend.Remove() }()
 
-	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter, allowlist, ctrl)
+	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter, allowlist, ctrl, ov)
 	fmt.Printf("guard intercepting on %s (mode=transparent, group=%s, entity=%s)\n", cfg.TransparentAddr, cfg.GuardGroup, cfg.EntityID)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)

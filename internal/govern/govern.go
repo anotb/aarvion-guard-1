@@ -22,6 +22,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
+	"github.com/aarvion-ai/aarvion-guard/internal/normalize"
 	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
@@ -234,7 +235,13 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	start := s.nowFn()
 	hreq := req.Attributes.Request.HTTP
 
-	dec, err := s.pol.GovernEval(ctx, s.buildInput(req))
+	// Classify the raw tool call into a typed semantic action once: the base OPA
+	// eval sees it as input.action.semantic, the tighten-only overlay matches its
+	// facets, and its Verb/Findings enrich the audit row. The normalizer is
+	// guard-side so a hostile plugin can't lie past semantic policy.
+	sem := normalize.Classify(req.Action.Tool, req.Action.Args, req.Ctx.Surface)
+
+	dec, err := s.pol.GovernEval(ctx, s.buildInput(req, sem))
 	if err != nil {
 		dec = s.failMode(req)
 	}
@@ -245,12 +252,20 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	// egress path, the PDP supports "ask", so an ask rule stays an ask here.
 	if dec.Allowed && s.cfg.Overlay != nil {
 		act := overlay.Action{
-			Tool:    req.Action.Tool,
-			Command: commandString(req.Action),
-			Host:    hreq.Host,
-			Method:  hreq.Method,
-			Path:    hreq.Path,
-			Surface: req.Ctx.Surface,
+			Tool:      req.Action.Tool,
+			Command:   commandString(req.Action),
+			Host:      hreq.Host,
+			Method:    hreq.Method,
+			Path:      hreq.Path,
+			Surface:   sem.Surface,
+			Verb:      sem.Verb,
+			Binary:    sem.Binary,
+			Channel:   sem.Channel,
+			Principal: req.Ctx.Caller.PrincipalID,
+			Targets:   sem.Targets,
+			Findings:  sem.Findings,
+			Flags:     sem.Flags,
+			Now:       s.nowFn(),
 		}
 		if r, ok := s.cfg.Overlay.Match(act); ok {
 			dec.PolicyID = r.ID
@@ -295,6 +310,8 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		CallerPrincipalID: req.Ctx.Caller.PrincipalID,
 		CallerSessionID:   req.Ctx.Caller.SessionID,
 		CallerSource:      req.Ctx.Caller.Source,
+		Verb:              sem.Verb,
+		Findings:          sem.Findings,
 	})
 
 	resp := &Response{
@@ -313,8 +330,10 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 }
 
 // buildInput assembles the extended OPA input from the request: the http block
-// (which today's packs match on) plus forward-looking caller/action context.
-func (s *Server) buildInput(req *Request) policy.GovernInput {
+// (which today's packs match on) plus forward-looking caller/action context and
+// the normalized semantic action (input.action.semantic.*), so packs can branch
+// on surface/verb/findings instead of fragile substrings of the raw command.
+func (s *Server) buildInput(req *Request, sem normalize.Action) policy.GovernInput {
 	h := req.Attributes.Request.HTTP
 	return policy.GovernInput{
 		ContractVersion: contractVersion,
@@ -335,8 +354,26 @@ func (s *Server) buildInput(req *Request) policy.GovernInput {
 			"operation":   req.Action.Operation,
 			"args":        req.Action.Args,
 			"args_digest": req.Action.ArgsDigest,
+			"semantic":    semanticInput(sem),
 		},
 		Attributes: policy.HTTPAttributes(h.Method, h.Host, h.Path, h.Body, h.Headers),
+	}
+}
+
+// semanticInput flattens the normalized Action into the map OPA sees at
+// input.action.semantic. Fields are spelled out (rather than reflected) so the
+// wire shape is stable and reviewable.
+func semanticInput(sem normalize.Action) map[string]any {
+	return map[string]any{
+		"surface":  sem.Surface,
+		"verb":     sem.Verb,
+		"binary":   sem.Binary,
+		"account":  sem.Account,
+		"channel":  sem.Channel,
+		"targets":  sem.Targets,
+		"host":     sem.Host,
+		"flags":    sem.Flags,
+		"findings": sem.Findings,
 	}
 }
 

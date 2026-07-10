@@ -225,6 +225,50 @@ func TestGovernanceMetadataDoesNotChangeRowHash(t *testing.T) {
 	}
 }
 
+// The semantic fields (Verb, Findings) are row metadata for the console/audit,
+// not hash inputs — exactly like the caller_* governance metadata. Two rows with
+// identical core fields must produce the SAME row_hash whether or not Verb and
+// Findings are set, so semantic enrichment never perturbs the CP's linkage-only
+// chain verify. If this breaks, one of these fields leaked into hashFields.
+func TestSemanticFieldsDoNotChangeRowHash(t *testing.T) {
+	base := Record{
+		Timestamp: "2026-07-09T00:00:00Z",
+		Method:    "POST",
+		Host:      "api.example.com",
+		Path:      "/x",
+		Decision:  "deny",
+		Enforced:  true,
+		PolicyID:  "pol-1",
+		Reason:    "blocked",
+		Surface:   "twitter",
+	}
+
+	// Bare row: no semantic metadata.
+	r1 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "a.json"))
+	bare := base
+	r1.AddGoverned(bare)
+	bareHash := r1.pending[0].RowHash
+
+	// Same core fields, but Verb + Findings populated.
+	r2 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "b.json"))
+	withSem := base
+	withSem.Verb = "post"
+	withSem.Findings = []string{"secret:ghp", "pii:email"}
+	r2.AddGoverned(withSem)
+	semHash := r2.pending[0].RowHash
+
+	if bareHash != semHash {
+		t.Fatalf("semantic fields changed row_hash:\n bare=%s\n  sem=%s", bareHash, semHash)
+	}
+	// The fields still survive on the row for the console/audit.
+	if r2.pending[0].Verb != "post" {
+		t.Fatalf("Verb lost from row: got %q", r2.pending[0].Verb)
+	}
+	if len(r2.pending[0].Findings) != 2 {
+		t.Fatalf("Findings lost from row: got %v", r2.pending[0].Findings)
+	}
+}
+
 // AddGoverned stamps Origin="runtime" and preserves the caller metadata on the
 // row, while the existing proxy Add path stays Origin="proxy".
 func TestOriginTagging(t *testing.T) {

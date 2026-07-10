@@ -51,6 +51,13 @@ type Record struct {
 	Phase             string `json:"phase,omitempty"`
 	Origin            string `json:"origin,omitempty"`
 
+	// Semantic enrichment from internal/normalize (set on the runtime PDP path).
+	// Like the caller_* fields above these are row metadata only - NOT hashed - so
+	// a governed row's row_hash is unchanged by semantic classification. Do not add
+	// either to hashFields without reconciling the DP shipper + CP verify.
+	Verb     string   `json:"verb,omitempty"`
+	Findings []string `json:"findings,omitempty"`
+
 	PrevHash string `json:"prev_hash"`
 	RowHash  string `json:"row_hash"`
 }

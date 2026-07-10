@@ -422,6 +422,48 @@ func TestOverlayEscalatesAllowToAsk(t *testing.T) {
 	}
 }
 
+// The overlay now sees the SEMANTIC facets the normalizer produces, not just the
+// raw command. A shell action "bird tweet hello" classifies to {surface:twitter,
+// verb:post}; a semantic overlay rule matching that surface+verb must escalate the
+// base ALLOW to deny with a "local_overlay:" reason. This proves the normalizer is
+// wired into the PDP -> overlay path (the base OPA must ALLOW so the tighten-only
+// overlay is even consulted).
+func TestOverlaySemanticSurfaceVerbDeny(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "no-tweets",
+		Verdict: overlay.VerdictDeny,
+		Reason:  "twitter is read-only",
+		Enabled: true,
+		Match: overlay.Match{
+			Surfaces: []string{"twitter"},
+			Verbs:    []string{"post"},
+		},
+	})
+	client, sock := startServer(t, Config{Overlay: ov}, opaStub(t, true))
+
+	req := sampleRequest("n-sem-tweet", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "bird tweet hello"}
+	req.Ctx.Surface = "exec"
+
+	resp := post(t, client, sock, testToken, req)
+	out := decode(t, resp)
+	if out.Verdict != VerdictDeny {
+		t.Fatalf("semantic post: got verdict %q want deny", out.Verdict)
+	}
+	if !strings.HasPrefix(out.Reason, "local_overlay:") {
+		t.Fatalf("reason not from overlay: got %q want local_overlay: prefix", out.Reason)
+	}
+
+	// A read-only twitter verb (bird search) must NOT trip the post rule, so the
+	// base allow stands - confirming the facet match is verb-specific.
+	req2 := sampleRequest("n-sem-search", "POST", "api.example.com")
+	req2.Action = Action{Tool: "exec", Args: "bird search cats"}
+	req2.Ctx.Surface = "exec"
+	if out := decode(t, post(t, client, sock, testToken, req2)); out.Verdict != VerdictAllow {
+		t.Fatalf("bird search should stay allowed: got %q", out.Verdict)
+	}
+}
+
 // The overlay is tighten-only: when the base policy DENIES, a matching overlay
 // rule must not be consulted and can never loosen the deny.
 func TestOverlayNeverLoosensBaseDeny(t *testing.T) {

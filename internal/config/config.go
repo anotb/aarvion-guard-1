@@ -34,6 +34,32 @@ type Config struct {
 	RateLimit     RateLimit     `json:"rate_limit,omitempty"`
 	Allowlist     Allowlist     `json:"allowlist,omitempty"`
 	Learn         Learn         `json:"learn,omitempty"`
+	Control       Control       `json:"control,omitempty"`
+}
+
+// Control configures the two file-driven emergency levers a fleet operator pulls
+// without a control-plane round-trip or a guard restart:
+//
+//   - Kill-switch (freeze): while FreezeFile exists, the guard hard-denies ALL
+//     egress within one poll — including essential/LLM hosts, so a hijacked agent
+//     is fully stopped (this overrides the fail-closed-with-essential posture).
+//   - Break-glass: while BreakGlassFile exists AND its mtime is within
+//     BreakGlassMinutes, the guard allows everything but tags each request as a
+//     non-enforced bypass so it's fully audited. Re-touching the file extends the
+//     window; it auto-expires so a forgotten bypass closes itself.
+//
+// Empty file paths default to ~/.aarvion/freeze and ~/.aarvion/breakglass. When
+// Enabled is false (or the struct is absent) no controller is built and there is
+// zero overhead — the decision path behaves exactly as before.
+//
+//   - BreakGlassMinutes: break-glass window after the file mtime (default 15).
+//   - PollEverySeconds: how often the control files are stat'd (default 2).
+type Control struct {
+	Enabled           bool   `json:"enabled"`
+	FreezeFile        string `json:"freeze_file,omitempty"`
+	BreakGlassFile    string `json:"break_glass_file,omitempty"`
+	BreakGlassMinutes int    `json:"break_glass_minutes,omitempty"`
+	PollEverySeconds  int    `json:"poll_every_seconds,omitempty"`
 }
 
 // Learn configures the learn-mode observer: it watches real egress and writes a
@@ -138,6 +164,14 @@ func ChainPath() string { return filepath.Join(Dir(), "chain.json") }
 // ProposalPath is the default location for the learn observer's proposed
 // allowlist, used when learn.proposal_path is unset.
 func ProposalPath() string { return filepath.Join(Dir(), "proposed-allowlist.json") }
+
+// FreezePath is the default kill-switch control file, used when
+// control.freeze_file is unset. Its mere presence freezes all egress.
+func FreezePath() string { return filepath.Join(Dir(), "freeze") }
+
+// BreakGlassPath is the default break-glass control file, used when
+// control.break_glass_file is unset. Its presence opens a time-boxed bypass.
+func BreakGlassPath() string { return filepath.Join(Dir(), "breakglass") }
 
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())

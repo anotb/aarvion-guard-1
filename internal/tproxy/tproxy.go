@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
+	"github.com/aarvion-ai/aarvion-guard/internal/control"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
@@ -21,10 +22,10 @@ type Server struct {
 	origDst func(net.Conn) (netip.AddrPort, error)
 }
 
-func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error), limiter *ratelimit.Limiter, allowlist mitm.Allowlist) *Server {
+func New(addr string, c *ca.CA, pol *policy.Client, rec *decisions.Recorder, essential []string, origDst func(net.Conn) (netip.AddrPort, error), limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller) *Server {
 	return &Server{
 		addr:    addr,
-		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist},
+		deps:    mitm.Deps{CA: c, Pol: pol, Rec: rec, Essential: mitm.Essentials(essential), Limiter: limiter, Allowlist: allowlist, Control: ctrl},
 		origDst: origDst,
 	}
 }

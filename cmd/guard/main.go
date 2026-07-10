@@ -19,6 +19,7 @@ import (
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/config"
+	"github.com/aarvion-ai/aarvion-guard/internal/control"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/govern"
 	"github.com/aarvion-ai/aarvion-guard/internal/heartbeat"
@@ -93,6 +94,30 @@ func buildAllowlist(cfg *config.Config) mitm.Allowlist {
 		return mitm.Allowlist{}
 	}
 	return mitm.Allowlist{Mode: al.Mode, Hosts: mitm.Essentials(al.Hosts)}
+}
+
+// buildControl constructs the file-driven emergency-lever controller (kill-switch
+// + break-glass) from config, or nil when control is disabled. A nil controller
+// threads into the proxy/tproxy Deps unchanged, so "control off" is exactly the
+// pre-feature behavior with zero overhead. The freeze/break-glass file paths
+// default to the well-known locations under the aarvion dir when unset, so an
+// operator can `touch ~/.aarvion/freeze` without editing the config.
+func buildControl(cfg *config.Config) *control.Controller {
+	c := cfg.Control
+	if !c.Enabled {
+		return nil
+	}
+	freeze := c.FreezeFile
+	if freeze == "" {
+		freeze = config.FreezePath()
+	}
+	breakGlass := c.BreakGlassFile
+	if breakGlass == "" {
+		breakGlass = config.BreakGlassPath()
+	}
+	window := time.Duration(c.BreakGlassMinutes) * time.Minute
+	poll := time.Duration(c.PollEverySeconds) * time.Second
+	return control.New(freeze, breakGlass, window, poll)
 }
 
 func main() {
@@ -307,6 +332,23 @@ func cmdRun() {
 		fmt.Printf("egress allowlist active (mode=%s, %d hosts)\n", allowlist.Mode, len(cfg.Allowlist.Hosts))
 	}
 
+	// Optional emergency levers (kill-switch + break-glass) driven by touching two
+	// files, polled on a ticker. nil when control is disabled, which preserves the
+	// prior behavior. Its poller runs alongside the proxy for the process lifetime.
+	ctrl := buildControl(cfg)
+	if ctrl != nil {
+		go ctrl.Run(ctx)
+		freezePath := cfg.Control.FreezeFile
+		if freezePath == "" {
+			freezePath = config.FreezePath()
+		}
+		breakGlassPath := cfg.Control.BreakGlassFile
+		if breakGlassPath == "" {
+			breakGlassPath = config.BreakGlassPath()
+		}
+		fmt.Printf("emergency control active (freeze=%s, break_glass=%s)\n", freezePath, breakGlassPath)
+	}
+
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
@@ -330,7 +372,7 @@ func cmdRun() {
 	}
 
 	if cfg.Mode == config.ModeTransparent {
-		runTransparent(ctx, cfg, pol, rec, limiter, allowlist)
+		runTransparent(ctx, cfg, pol, rec, limiter, allowlist, ctrl)
 	} else {
 		var authority *ca.CA
 		if cfg.Inspect {
@@ -340,7 +382,7 @@ func cmdRun() {
 			}
 			authority = a
 		}
-		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter, allowlist)
+		srv := proxy.New(cfg.ProxyAddr, authority, pol, rec, essentialHosts(cfg), cfg.PassthroughHosts, cfg.Inspect, limiter, allowlist, ctrl)
 		fmt.Printf("guard listening on http://%s (mode=forward, inspect=%t, entity=%s)\n", cfg.ProxyAddr, cfg.Inspect, cfg.EntityID)
 		if err := srv.ListenAndServe(ctx); err != nil {
 			fatal(err)
@@ -349,7 +391,7 @@ func cmdRun() {
 	fmt.Println("guard stopped")
 }
 
-func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter, allowlist mitm.Allowlist) {
+func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client, rec *decisions.Recorder, limiter *ratelimit.Limiter, allowlist mitm.Allowlist, ctrl *control.Controller) {
 	gid, err := ensureGroup(cfg.GuardGroup)
 	if err != nil {
 		fatal(fmt.Errorf("group %q: %w (run with sudo)", cfg.GuardGroup, err))
@@ -373,7 +415,7 @@ func runTransparent(ctx context.Context, cfg *config.Config, pol *policy.Client,
 	// OpenClaw's egress black-holed.
 	defer func() { _ = backend.Remove() }()
 
-	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter, allowlist)
+	srv := tproxy.New(cfg.TransparentAddr, authority, pol, rec, essentialHosts(cfg), intercept.OriginalDst, limiter, allowlist, ctrl)
 	fmt.Printf("guard intercepting on %s (mode=transparent, group=%s, entity=%s)\n", cfg.TransparentAddr, cfg.GuardGroup, cfg.EntityID)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[tproxy] %v\n", err)

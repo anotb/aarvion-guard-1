@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
+	"github.com/aarvion-ai/aarvion-guard/internal/control"
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/ratelimit"
@@ -43,6 +44,13 @@ type Deps struct {
 	// value (mode "") disables gating entirely and preserves the pre-feature
 	// behavior exactly.
 	Allowlist Allowlist
+
+	// Control is an optional file-driven emergency lever set: kill-switch (freeze)
+	// and break-glass. It's checked as the VERY FIRST thing in Decide, ahead of
+	// rate-limit/allowlist/OPA. A nil Control (both Frozen and BreakGlass read
+	// false through the nil-receiver methods) disables both levers and preserves
+	// the pre-feature behavior exactly.
+	Control *control.Controller
 }
 
 // Allowlist configures a default-deny egress posture: only approved (or
@@ -185,7 +193,16 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 // Decide evaluates OPA for one request, applying the fail-closed-with-essential
 // posture when OPA can't be reached.
 //
-// The rate-limit ceiling is checked FIRST, before any OPA call: if a limiter is
+// The emergency control levers are checked FIRST, ahead of everything else. If a
+// Controller is attached and frozen, the request is hard-denied (403,
+// "frozen") — this deliberately overrides the essential/LLM fail-open too, so a
+// freeze stops a hijacked agent completely. Otherwise, if break-glass is active,
+// the request is allowed (200, "break_glass") but marked Enforced:false so the
+// audit records it as a non-enforced bypass; the "break_glass" reason then rides
+// the normal allow-recording path (which already forwards dec.Reason). A nil
+// Controller reads false for both levers and skips this block entirely.
+//
+// The rate-limit ceiling is checked next, before any OPA call: if a limiter is
 // configured and this host is over its per-window ceiling, the request is
 // short-circuited to a deny (429, reason "rate_limited"). This runs entirely in
 // memory, so a runaway loop is cut off cheaply without loading OPA, and — because
@@ -200,6 +217,17 @@ func (d Deps) ServePlain(conn net.Conn, dialAddr string) {
 // operator sees what enforcement WOULD block. An off/empty mode skips this block
 // entirely, preserving the exact prior behavior.
 func (d Deps) Decide(method, host, path, body string, headers map[string]string) *policy.Decision {
+	// Emergency levers first — a nil Controller reads false for both and is skipped.
+	if d.Control.Frozen() {
+		// Freeze denies everything, including essential/LLM hosts: a hijacked agent
+		// is fully stopped, overriding the fail-closed-with-essential fail-open.
+		return &policy.Decision{Allowed: false, HTTPStatus: http.StatusForbidden, PolicyID: "guard", Reason: "frozen", Enforced: true}
+	}
+	if d.Control.BreakGlass() {
+		// Time-boxed audited bypass: allow, but mark it non-enforced so the audit
+		// row shows a bypass rather than a policy-backed allow.
+		return &policy.Decision{Allowed: true, HTTPStatus: http.StatusOK, PolicyID: "guard", Reason: "break_glass", Enforced: false}
+	}
 	if d.Limiter != nil && !d.Limiter.Allow(host, time.Now()) {
 		return &policy.Decision{Allowed: false, HTTPStatus: http.StatusTooManyRequests, PolicyID: "guard", Reason: "rate_limited", Enforced: true}
 	}

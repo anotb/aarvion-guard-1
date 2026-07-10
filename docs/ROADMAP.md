@@ -6,6 +6,26 @@
 
 ---
 
+## Shipped — governance engine, phases A–C (branch `feat/governance-engine`)
+
+Designed and tested (unit + integration); design spec in `docs/superpowers/specs/2026-07-10-openclaw-governance-engine-design.md`. This is the semantic-action + policy-pack + ask-verdict layer built around the existing PDP. The items it closes are struck through in the waves below.
+
+- ✅ **Semantic action normalizer** (`internal/normalize`) — every OpenClaw tool call is classified into a typed `SemanticAction {surface, verb, targets, host, flags, findings}`. Covers `gog` (Google: email/drive/docs/calendar), `bird` (Twitter/X), `gh`/`git` (GitHub), native comms (`message`/`sessions_send` → telegram/discord/whatsapp/reddit), `web_fetch`/curl (api), and `docker`/`systemctl` (infra). Replaces fragile substring matching with intent-aware facets (send vs read, delete vs list, external vs internal recipient), and runs guard-side so the plugin can't lie its way past semantic policy.
+- ✅ **DLP scan in the normalizer** — outbound bodies are scanned for secret markers (`ghp_`/`sk-`/`AKIA`/1Password refs) and coarse PII (email/phone), surfaced as `Findings` for the dlp-guard pack. Guard-native prefilter, not OPA regex. *This is DLP on the outbound **request** body only — response/inbound DLP and redaction are still not enforced (Wave 2).*
+- ✅ **Caller-identity-aware policy** — the overlay gained semantic facets (`Surfaces`, `Verbs`, `Principals`, `FlagsAll`, `FindingsAny`, plus a quiet-hours time window). Per-agent posture (e.g. `llm-twitter: enforce read-only`) is now expressible and enforced. *NB: this is the pack/overlay half. The keystone below — propagating a real per-agent identity triple from OpenClaw into each call — is still the precondition; packs key on `Principal`, but that field is only as trustworthy as what the runtime stamps.*
+- ✅ **7 consumer policy packs** (`internal/packs`) — social-guard, google-guard, comms-guard, dlp-guard, api-guard, github-guard, infra-guard. One pack schema, two compilers: a **tighten-only overlay** for the local console and full-strength **rego + data** for the CP-signed bundle (`examples/packs/`). Each pack has modes `off|observe|ask|enforce` and per-agent overrides. Packs default to `observe`.
+- ✅ **Learn-mode → promote** (`internal/sinks/behaviour.go` + `internal/packs`) — ships in `observe` (records what each agent actually does per `{principal, surface, verb}`, blocks nothing), then a one-click **Protect me now** promotes a proposal (read-only agents locked, sensitive verbs → ask, dlp → enforce) into the compiled overlay.
+- ✅ **`ask` as a first-class third verdict** (`internal/approve`) — a pending-approval store fans an `ask` to the owner over **Telegram** (owner taps Approve/Deny on their phone) or the console **Approvals inbox**; timeout → **deny** (fail-safe). The PEP plugin returns `ask` fast and polls `GET /v1/approvals/{id}` until resolved, so the govern socket isn't held open for minutes. Every resolution (who/how/when) is hash-chained.
+- ✅ **Local governance console** (`127.0.0.1:8790`, token-gated) — Packs board (toggle + mode + per-agent), Learning panel (profile + promote), Approvals inbox. `aarvion-guard dashboard` opens it pre-authed.
+
+**Honest scope of what shipped:**
+- The guard and OpenClaw **share uid 501** in the single-box deployment. This proves the governance **path**, not a tamper-proof boundary — a same-uid compromise can unset the plugin env, kill the guard, or edit config. Real enforcement still needs uid separation (Linux service account) or a system extension. See the keystone and Wave 0 below.
+- **The model's streamed response stays ungoverned.** The PEP governs tool *actions*, not the model's response stream. This is not "unbypassable."
+- **Response-body inspection and redaction are still not enforced** — `serve()` still `io.Copy`s the response straight through. The `ask` verdict and DLP-on-outbound-request-bodies shipped; inbound/response DLP, field-level redaction, and read-here-ship-there taint did not. See Wave 2 + Secrets & DLP.
+- Live proof on the mini is being run separately; the integrator will add that evidence. Do not read "shipped" here as "proven live end-to-end on the mac mini."
+
+---
+
 ## The thesis (read this first)
 
 Today aarvion-guard is a **network egress filter**: it allows/denies by method + host + path + body, request-only, one nameless egress identity per box.
@@ -16,8 +36,8 @@ So the product isn't "GitHub read-only." It's an **agent-action firewall**. And 
 
 > ### 🔑 THE KEYSTONE: caller identity
 > The guard cannot see *which* of the 7 agents / *what* session / *how-trusted* a context made a call. The decision schema already **reserves** `caller_principal_id / caller_session_id / caller_source` and always writes `nil`. About **two-thirds of every item below is unenforceable until this lands.** Build it first.
-> - **P0 · capability** — Propagate an agent/session/trust triple from OpenClaw into each egress request and thread it into OPA input + the hash chain.
-> - **P0 · capability** — Identity *source* on macOS forward-proxy (no Linux group-match here): give each agent its own local proxy listener port, or a per-agent proxy-auth credential the guard reads. Cheapest viable binding.
+> - **P0 · capability** — Propagate an agent/session/trust triple from OpenClaw into each egress request and thread it into OPA input + the hash chain. **Still open.** The consuming side landed (packs + overlay key on `Principal`, and the PEP plugin funnels tool calls through `before_tool_call` so the runtime *can* stamp identity), but a trustworthy per-agent triple stamped by OpenClaw into every call is not yet built.
+> - **P0 · capability** — Identity *source* on macOS forward-proxy (no Linux group-match here): give each agent its own local proxy listener port, or a per-agent proxy-auth credential the guard reads. Cheapest viable binding. **Still open.**
 > - Needs an OpenClaw-side contribution (stamp identity per outbound call) + guard-side plumbing. This is a joint gateway↔guard change; scope it with the moltbot team.
 
 ---
@@ -39,8 +59,8 @@ The advisory-proxy-guarding-exfilable-secrets-on-the-same-box problem. Ship thes
 - [ ] **In-guard rate + daily-USD budget accumulator that works when OPA is down** — closes the essential-host fail-OPEN "untethered spend" hole; persist like `chain.json`.
 
 ### Wave 2 — the one genuinely new capability everything ambitious needs
-- [ ] **"ask" as a first-class third OPA verdict** (allow / deny / **ask**) — the guard must be able to **park** an in-flight request, fan an approval prompt to the owner over their *own* Telegram (id `6575353438`) / Discord / dashboard, and resume-or-timeout on the reply. This turns "deny" into "ask me," and is the load-bearing capability under every HITL item in every domain.
-- [ ] **Response inspection** — today `serve()` `io.Copy`s the response straight back. Needed for: spend metering (read token counts out of LLM responses), secret-egress correlation (read-here-ship-there taint), DLP on inbound content, and HA state-awareness rules.
+- [x] ~~**"ask" as a first-class third OPA verdict** (allow / deny / **ask**) — the guard must be able to **park** an in-flight request, fan an approval prompt to the owner over their *own* Telegram / dashboard, and resume-or-timeout on the reply.~~ **Shipped** (`internal/approve` + console inbox; `ask` returns fast, plugin polls `GET /v1/approvals/{id}`, timeout → deny). Telegram + console approver both work; Discord approver not built. This is the load-bearing capability under every HITL item below.
+- [ ] **Response inspection** — **still open.** `serve()` still `io.Copy`s the response straight back. Needed for: spend metering (read token counts out of LLM responses), secret-egress correlation (read-here-ship-there taint), DLP on inbound content, and HA state-awareness rules. The shipped DLP scans outbound *request* bodies only.
 - [ ] **Bidirectional control channel** — the heartbeat is fire-and-forget; make its response carry signed commands (kill-switch / freeze-one-agent / budget-lift / break-glass token).
 
 ---
@@ -58,14 +78,14 @@ The "what else needs governing" catalog. Each is a shippable policy pack keyed t
 - [ ] **Approval-pending** verdict for high-blast-radius writes (rides the "ask" capability + the existing `HTTPStatus` channel).
 
 ### Outbound comms & "acting as you"
-- [ ] **Approve-before-send** for identity-visible posts (X, Gmail, DMs) — draft-and-confirm as the default send UX.
-- [ ] **Per-agent send-capability allowlist** (least privilege across 41 skills: `reddit-digest` never sends; `llm-twitter` posts only to X `POST /2/tweets`-shaped paths).
-- [ ] **Recipient allowlist** for DMs/email; **rate + burst caps** per channel per agent; **quiet hours** for autonomous sends; content/injection-signature policy on send bodies.
+- [x] ~~**Approve-before-send** for identity-visible posts (X, Gmail, DMs) — draft-and-confirm as the default send UX.~~ **Shipped** as `ask`-before-send in social-guard / google-guard / comms-guard (verb = post/reply/dm/send → ask, resolved over Telegram or console). Semantic-normalizer-driven, so it fires on the tool call itself, not on an opaque HTTPS `CONNECT`.
+- [x] ~~**Per-agent send-capability allowlist** (`reddit-digest` never sends; `llm-twitter` posts only to X)~~ **Shipped** via per-agent pack overrides + the `Principals` overlay facet (e.g. social-guard `llm-twitter: enforce read-only`). *Caveat: only as strong as the caller-identity keystone — the `Principal` value must be a trustworthy per-agent stamp, which is still open.*
+- [x] ~~**Recipient allowlist** for DMs/email; **quiet hours** for autonomous sends~~ **Shipped** in comms-guard (`recipient_allowlist` param + quiet-hours time-window facet) and google-guard (`contact_allowlist`). Content policy on send bodies is covered by dlp-guard (outbound request body). **Per-channel rate + burst caps are not wired into packs yet** (the `internal/ratelimit` primitive exists but is not surfaced as a pack param).
 
 ### Secrets & DLP
-- [ ] **Secret-pattern detector** as a guard-native prefilter (exact-value hash set built from the service-env + regex classes) — don't make OPA regex bodies.
-- [ ] **1Password egress governance** — which agent, which vault item, how often.
-- [ ] **Secret-to-novel-host correlation** (read here, ship there) — needs response inspection + per-session taint.
+- [x] ~~**Secret-pattern detector** as a guard-native prefilter — don't make OPA regex bodies.~~ **Shipped** in `internal/normalize` (DLP scan for secret markers `ghp_`/`sk-`/`AKIA`/1Password refs + coarse PII), surfaced as `Findings` and consumed by dlp-guard (`FindingsAny` overlay facet → deny/ask). *Scans the outbound **request** body only; the exact-value hash set built from the live service-env is not yet wired.*
+- [ ] **1Password egress governance** — which agent, which vault item, how often. (1Password ref markers are detected, but per-vault-item usage governance is not built.)
+- [ ] **Secret-to-novel-host correlation** (read here, ship there) — **still open;** needs response inspection + per-session taint (neither shipped).
 - [ ] **Per-secret-class destination scoping** — homelab creds never leave `192.168.1.x`.
 - [ ] Keep MITM inspection ON for OpenAI/Anthropic bodies (decouple "fail-closed essential" from "inspection-exempt").
 
@@ -81,12 +101,12 @@ The "what else needs governing" catalog. Each is a shippable policy pack keyed t
 ---
 
 ## Part 3 — UX & functionality
-- [ ] **Observe/Learn mode** → after N days, auto-propose an allowlist + write-endpoint map from recorded decisions (the corpus already exists in `decisions.Recorder` + CP). This is the adoption unlock for a single-owner box with no staging.
-- [ ] **Inline approval** over Telegram/Discord/dashboard: allow / deny / and-reason, with unattended-timeout handling.
-- [ ] **Policy template catalog**: read-only-github, no-social-without-approval, HA-safety-lock, secret-exfil-block, LLM-spend-cap — authored against this instance's real hosts.
+- [x] ~~**Observe/Learn mode** → auto-propose an allowlist + write-endpoint map from recorded decisions.~~ **Shipped** as the semantic behaviour profile (`internal/sinks/behaviour.go`, keyed on `{principal, surface, verb}`) + `packs.ProposeFromProfile` + the console **Learning** panel's **Protect me now**. Proposes from the *semantic* profile rather than raw egress rows.
+- [x] ~~**Inline approval** over Telegram/Discord/dashboard: allow / deny, with unattended-timeout handling.~~ **Shipped** for **Telegram + dashboard** (`internal/approve`, timeout → deny). Discord approver channel not built; "and-reason" (structured deny reason from the approver) not built.
+- [x] ~~**Policy template catalog**: read-only-github, no-social-without-approval, secret-exfil-block — authored against this instance's real surfaces.~~ **Shipped** as the 7 packs (`internal/packs` + `examples/packs`): social/google/comms/dlp/api/github/infra. HA-safety-lock and an LLM-spend-cap pack are **not** in the set yet (no HA-semantic surface in the normalizer; spend metering needs response inspection).
 - [ ] **Natural-language → Rego** authoring with a dry-run preview (use the owner's own Anthropic key CP-side) + a Rego linter.
 - [ ] **Dry-run / simulation**: "what would this policy have denied last week" against stored decision rows.
-- [ ] **Dashboard**: live decision feed filterable by agent/service/decision (denies pinned); "morning check" summary; new-destination + deny-spike alerts; incident timeline reconstruction from the hash chain; guard-health/bypass panel ("is governance actually on?").
+- [~] **Dashboard**: the loopback console (`127.0.0.1:8790`, `aarvion-guard dashboard`) shipped with **Packs board + Learning panel + Approvals inbox**. Still open: live decision feed filterable by agent/service/decision (denies pinned); "morning check" summary; new-destination + deny-spike alerts; incident timeline reconstruction from the hash chain; guard-health/bypass panel ("is governance actually on?").
 - [ ] **SIEM / webhook / syslog export** of the decision stream (CP-side fan-out, no guard change).
 - [ ] **Kill-switch / break-glass** from the dashboard (freeze all egress or one agent).
 

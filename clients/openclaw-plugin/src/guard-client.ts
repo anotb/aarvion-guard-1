@@ -18,6 +18,10 @@ export interface GuardConfig {
 	failMode: GuardFailMode;
 	timeoutMs: number;
 	governMode: GovernMode;
+	/** Total window to wait for a human to approve/deny an `ask` verdict. */
+	approvalTimeoutMs: number;
+	/** How often to re-poll GET /v1/approvals/{id} while it stays "pending". */
+	approvalPollMs: number;
 }
 
 export interface GuardVerdict {
@@ -36,6 +40,8 @@ export interface GuardActionInput {
 }
 
 const DEFAULT_TIMEOUT_MS = 2_000;
+const DEFAULT_APPROVAL_TIMEOUT_MS = 90_000; // how long we wait for a human before failing safe
+const DEFAULT_APPROVAL_POLL_MS = 2_000; // how often we re-check a pending approval
 const MAX_FIELD_BYTES = 16_384; // bound any single string so we never trip the guard's 1MiB cap
 
 // Shell/command-runner tools whose payload is a literal command string.
@@ -150,6 +156,11 @@ export function resolveGuardConfig(env: NodeJS.ProcessEnv = process.env): GuardC
 	const governMode: GovernMode = modeRaw === "all" ? "all" : modeRaw === "exec" ? "exec" : "actions";
 	const parsedTimeout = Number.parseInt(env.OPENCLAW_GUARD_TIMEOUT_MS?.trim() ?? "", 10);
 	const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : DEFAULT_TIMEOUT_MS;
+	const parsedApproval = Number.parseInt(env.OPENCLAW_GUARD_APPROVAL_TIMEOUT_MS?.trim() ?? "", 10);
+	const approvalTimeoutMs =
+		Number.isFinite(parsedApproval) && parsedApproval > 0 ? parsedApproval : DEFAULT_APPROVAL_TIMEOUT_MS;
+	const parsedPoll = Number.parseInt(env.OPENCLAW_GUARD_APPROVAL_POLL_MS?.trim() ?? "", 10);
+	const approvalPollMs = Number.isFinite(parsedPoll) && parsedPoll > 0 ? parsedPoll : DEFAULT_APPROVAL_POLL_MS;
 	return {
 		enabled: envFlag(env.OPENCLAW_GUARD_ENABLED) && Boolean(socketPath) && Boolean(token),
 		socketPath,
@@ -157,6 +168,8 @@ export function resolveGuardConfig(env: NodeJS.ProcessEnv = process.env): GuardC
 		failMode,
 		timeoutMs,
 		governMode,
+		approvalTimeoutMs,
+		approvalPollMs,
 	};
 }
 
@@ -263,4 +276,109 @@ export async function evaluateGuard(
 		return { verdict: "allow", failMode: true, reason: "guard_unreachable_fail_open" };
 	}
 	return { verdict: "deny", failMode: true, reason: "guard_unreachable_fail_closed", policyId: "guard.pep.fail_closed" };
+}
+
+// --- ask polling: GET /v1/approvals/{id} until a human resolves it ---------
+
+/** One poll of the approval's current state. `unreachable` = transport failed. */
+export type ApprovalStatus = "pending" | "allow" | "deny" | "unreachable";
+
+/** The subset of GuardConfig awaitApproval needs (socket + auth + cadence). */
+export interface ApprovalPollConfig {
+	socketPath: string | null;
+	token: string | null;
+	timeoutMs: number;
+	approvalTimeoutMs: number;
+	approvalPollMs: number;
+}
+
+interface ApprovalResponse {
+	status?: string;
+	reason?: string;
+}
+
+function parseApproval(raw: string): ApprovalStatus | null {
+	let parsed: ApprovalResponse;
+	try {
+		parsed = JSON.parse(raw) as ApprovalResponse;
+	} catch {
+		return null;
+	}
+	if (parsed.status === "pending" || parsed.status === "allow" || parsed.status === "deny") {
+		return parsed.status;
+	}
+	return null;
+}
+
+/**
+ * One GET /v1/approvals/{id} over the SAME UDS the govern call used (bearer token
+ * + kernel peer-uid gated by the guard). Never throws; any transport/parse failure
+ * or non-2xx maps to "unreachable" so the caller can treat it as still-pending.
+ */
+export function fetchApprovalStatus(decisionId: string, config: ApprovalPollConfig): Promise<ApprovalStatus> {
+	if (!config.socketPath || !config.token) return Promise.resolve("unreachable");
+	const path = `/v1/approvals/${encodeURIComponent(decisionId)}`;
+	return new Promise<ApprovalStatus>((resolve) => {
+		let settled = false;
+		const done = (s: ApprovalStatus): void => {
+			if (settled) return;
+			settled = true;
+			resolve(s);
+		};
+		const req = httpRequest(
+			{
+				socketPath: config.socketPath as string,
+				path,
+				method: "GET",
+				headers: { authorization: `Bearer ${config.token}` },
+				timeout: config.timeoutMs,
+			},
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on("data", (c: Buffer) => chunks.push(c));
+				res.on("end", () => {
+					if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) return done("unreachable");
+					done(parseApproval(Buffer.concat(chunks).toString("utf8")) ?? "unreachable");
+				});
+			},
+		);
+		req.on("error", () => done("unreachable"));
+		req.on("timeout", () => {
+			req.destroy();
+			done("unreachable");
+		});
+		req.end();
+	});
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Poll the guard for a human's decision on an `ask` verdict. Returns "allow" only
+ * when the owner explicitly approved; "deny" on explicit denial, on the overall
+ * timeout, and on a persistently unreachable guard (fail-safe). The `poll` arg is
+ * injectable for tests; it defaults to the real UDS GET above.
+ *
+ * The clock is driven off `Date.now()` so the loop honours the real wall-clock
+ * budget regardless of how long any single poll takes.
+ */
+export async function awaitApproval(
+	decisionId: string,
+	config: ApprovalPollConfig,
+	poll: (id: string, c: ApprovalPollConfig) => Promise<ApprovalStatus> = fetchApprovalStatus,
+	now: () => number = Date.now,
+): Promise<"allow" | "deny"> {
+	if (!decisionId) return "deny";
+	const deadline = now() + config.approvalTimeoutMs;
+	// Always poll at least once before checking the deadline, so a zero/near-zero
+	// budget still gives an already-resolved decision a chance to be seen.
+	for (;;) {
+		const status = await poll(decisionId, config);
+		if (status === "allow") return "allow";
+		if (status === "deny") return "deny";
+		// "pending" or "unreachable": wait and retry until the budget runs out.
+		if (now() >= deadline) return "deny";
+		await sleep(config.approvalPollMs);
+		if (now() >= deadline) return "deny";
+	}
 }

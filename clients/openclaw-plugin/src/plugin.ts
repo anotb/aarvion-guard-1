@@ -8,7 +8,7 @@
 //
 // Self-contained: declares the minimal slice of the OpenClaw host API it uses, so
 // it builds and loads with ZERO dependency on the OpenClaw source.
-import { evaluateGuard } from "./guard-client.js";
+import { awaitApproval, evaluateGuard, resolveGuardConfig } from "./guard-client.js";
 
 export interface ToolPolicyEvent {
 	toolName?: string;
@@ -57,18 +57,34 @@ export function registerAarvionGuardPlugin(api: GuardHostApi): void {
 			const toolName = event.toolName ?? ctx.toolName;
 			if (!toolName) return;
 
-			const verdict = await evaluateGuard({
-				toolName,
-				params: event.params ?? {},
-				agentId: ctx.agentId,
-				sessionKey: ctx.sessionKey,
-			});
+			const config = resolveGuardConfig();
+			const verdict = await evaluateGuard(
+				{
+					toolName,
+					params: event.params ?? {},
+					agentId: ctx.agentId,
+					sessionKey: ctx.sessionKey,
+				},
+				config,
+			);
 			if (verdict.verdict === "deny") {
 				const detail = verdict.reason ?? verdict.policyId ?? "denied";
 				return { block: true, blockReason: `Aarvion guard: ${detail}` };
 			}
 			if (verdict.verdict === "ask") {
-				// Third verdict: pause for owner approval via OpenClaw's native
+				// Third verdict: a human must approve. The guard has already opened a
+				// pending, notified the owner over Telegram, and surfaced it in the
+				// console inbox. We poll GET /v1/approvals/{id} over the same socket
+				// until the owner taps approve/deny or we hit the budget.
+				if (verdict.decisionId) {
+					const outcome = await awaitApproval(verdict.decisionId, config);
+					if (outcome === "allow") return; // owner approved -> let the call run
+					return {
+						block: true,
+						blockReason: `Aarvion guard: ${verdict.reason ?? "approval denied or timed out"}`,
+					};
+				}
+				// Older guard with no decision_id: fall back to OpenClaw's native
 				// approval flow. If no one responds it times out to a deny (fail-safe).
 				return {
 					requireApproval: {

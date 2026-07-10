@@ -30,13 +30,38 @@ ones. It ships as an installable plugin (no OpenClaw source changes), backed by
 the same signed OPA engine + hash-chain as the proxy. Quickstart, install, and a
 multi-surface example policy: [`clients/openclaw-plugin/`](clients/openclaw-plugin/).
 
+## Local console & tighten-only overrides
+
+Not everyone wants to round-trip to the control plane to add one local rule. The
+guard serves a **loopback governance console** (`127.0.0.1` only, gated by a
+per-run bearer token at `~/.aarvion/console-token`, 0600) with a live decision
+feed and an editor for **local overlay rules**. Open it with:
+
+```
+aarvion-guard dashboard   # opens http://127.0.0.1:8790 in your browser, pre-authed
+```
+
+Overlay rules are **tighten-only**: a rule can only *add* a deny or an ask, never
+loosen a CP-signed decision. They're evaluated in Go **after** the base OPA
+decision and **only when it already allowed** the action, so the signed policy
+stays authoritative and a local rule can only ever add friction. On egress a
+match becomes a deny (a proxy can't pause); on the agent-action PDP it can deny
+or **ask** for your approval. Rules match on tool, command substring, host
+suffix, and method. Every edit also syncs up to the control plane (best-effort),
+so "changed it locally" and "the fleet view knows" stay consistent. The
+`beta.aarvion.ai` dashboard remains the authoritative multi-fleet console; this
+one is for a single-box operator who wants to tighten *now*.
+
 ## What works today (B0)
 
 - `init <code>` — claim a one-time pairing code from the Aarvion backend, store
   enrollment creds (`~/.aarvion/guard.json`, 0600), render the OPA config, and
   wire OpenClaw's egress (`HTTPS_PROXY` into its gateway service-env, backed up).
 - `run` — supervise the OPA sidecar (bundle pull + HS256 verify), serve the
-  forward proxy, push sampled decisions + heartbeats to the control plane.
+  forward proxy + the local governance console, push sampled decisions +
+  heartbeats to the control plane.
+- `dashboard` opens the loopback console (live feed + tighten-only overlay
+  editor) in your browser, pre-authed with the per-run token.
 - HTTPS governed at host level via CONNECT; plain HTTP sees full method/path.
 - Fail-closed with an essential-allow list (LLM providers) when OPA is down.
 - `status`, `uninstall` (restores the OpenClaw env, keeps the CP entity).
@@ -109,12 +134,15 @@ redaction rewriting, macOS notarization (needs your Apple cert).
 ## Layout
 
 ```
-cmd/guard        CLI: init / run / exec / service / repair / status / uninstall / version
+cmd/guard        CLI: init / onboard / run / dashboard / exec / service / update / repair / status / uninstall / version
 internal/config  guard.json state (0600)
 internal/pair    /api/openclaw/pair/claim client
 internal/opa     OPA config render + sidecar supervisor
 internal/policy  OPA eval client (envoy/authz/allow shape)
 internal/proxy   forward proxy (CONNECT + absolute-form HTTP)
+internal/overlay tighten-only local override store (deny/ask only, never loosen)
+internal/console loopback governance console: decision feed + overlay editor (embedded SPA)
+internal/cpsync  pushes local overlay + reports sync status to the control plane
 internal/ca      machine-local CA + on-the-fly leaf minting
 internal/intercept  kernel redirect backends (linux iptables; darwin stub) + SO_ORIGINAL_DST
 internal/tproxy  transparent server: SNI-terminate, MITM (streaming) or passthrough

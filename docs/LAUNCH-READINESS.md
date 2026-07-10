@@ -58,11 +58,27 @@ What's missing is the **control-plane UI + pipeline**, not guard support:
   the entity key, so `guard` picks it up on its next poll (5–15s) — no restart.
 - Surfacing the **decision feed** (the hash-chained audit the guard already
   emits) back in the dashboard so a user sees what got blocked/asked and can
-  tune policy from real events.
+  tune policy from real events. (The local console below already does exactly
+  this on-box; the CP just needs to do it centrally.)
 
 This is a CP/control-plane feature (a different service than this guard repo). The
 guard side is ready: it already evaluates and enforces whatever the CP signs, on
 both the network path and the `/v1/govern` runtime path.
+
+**Update (PR #28): the single-box version of this now ships in the guard itself.**
+A **local governance console** (`internal/console`) serves a loopback-only
+(127.0.0.1:8790), bearer-token-gated (`~/.aarvion/console-token`, 0600) dark
+aarvion-styled SPA with a **live hash-chained decision feed**, a **tighten-only
+overlay editor**, and a **sync-now** button. It's **on by default** after
+`init`/`onboard`; `aarvion-guard dashboard` opens it pre-authed. The overlay
+(`internal/overlay`, `~/.aarvion/overlay.json`) is local deny/ask rules that
+**can never loosen a CP-signed decision** — evaluated only after the base OPA
+decision *allowed*, matching on tool / command-substring / host-suffix / method,
+and wired into **both** enforcement paths (egress proxy → deny; agent-action PDP
+→ deny or ask). Edits **best-effort push to the control plane** (`internal/cpsync`)
+and degrade gracefully if the CP doesn't support them. beta.aarvion.ai stays
+authoritative; the local console is the single-box **quick-tighten** path, not a
+replacement for the CP dashboard above.
 
 ## Path to viral (prioritized)
 
@@ -90,9 +106,21 @@ both the network path and the `/v1/govern` runtime path.
 - **Done + proven live:** action governance across all surfaces (deny/allow),
   installable plugin on a stock OpenClaw (no fork), hash-chained audit with caller
   identity, ask verdict (guard-side coded + unit-tested; plugin returns
-  `requireApproval`). All in PR #28.
+  `requireApproval`), and the **local governance console + tighten-only overlay**
+  (loopback console, live decision feed, quick-tighten deny/ask that can't loosen
+  a CP decision, best-effort CP sync) — enforced on **both** the egress and
+  agent-action paths and covered by new mitm + govern unit tests. All in PR #28,
+  `go build/vet/test ./... -race` green, e2e-proven live 2026-07-10 (console UI
+  200, unauth API 401, authored deny → proxied request 403 with reason
+  `local_overlay:...`, non-match 200, non-tightening PUT rejected 400).
 - **Pending for launch:** publish the plugin (1), release the PDP-enabled guard
   (2), one-command onboarding (3), CP policy dashboard (4), demo clip (5). Items
-  1, 3, 5 are captured as backlog/handoff tasks.
+  1, 3, 5 are captured as backlog/handoff tasks. The **CP dashboard (4)** is
+  now partly de-risked: the local console proves the feed + tighten-and-sync UX
+  end-to-end, so the CP side is UI/pipeline work over a shape that's already live.
+- **Still-open blockers (do not mark done):** macOS codesign/notarization; npm
+  publish of `@aarvionai/guard`; the openclaw-plugin needs npm publish **and** a
+  real approval-socket for hard `ask` enforcement (today it's a `trustedToolPolicy`
+  veto seam, not a blocking prompt).
 - **Honest caveat unchanged:** tamper-proof enforcement needs the guard on a
   separate uid from the agent; same-uid governs the decision path only.

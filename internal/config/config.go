@@ -207,6 +207,10 @@ func BreakGlassPath() string { return filepath.Join(Dir(), "breakglass") }
 // the decision path enforces.
 func OverlayPath() string { return filepath.Join(Dir(), "overlay.json") }
 
+// PacksPath persists the operator's policy-pack configuration (the consumer
+// guardrails), which compiles down to overlay rules and rego.
+func PacksPath() string { return filepath.Join(Dir(), "packs.json") }
+
 // ConsoleTokenPath holds the random bearer token the console API requires; the
 // `dashboard` command reads it to open the browser pre-authenticated. 0600.
 func ConsoleTokenPath() string { return filepath.Join(Dir(), "console-token") }
@@ -214,6 +218,11 @@ func ConsoleTokenPath() string { return filepath.Join(Dir(), "console-token") }
 // DecisionsLogPath is the default local decision log the console's live feed
 // tails, used when console is enabled but no audit_jsonl_path is configured.
 func DecisionsLogPath() string { return filepath.Join(Dir(), "decisions.jsonl") }
+
+// BehaviourProfilePath persists the learn-mode behaviour profile: what each
+// agent actually does per {principal,surface,verb}, used by the console and the
+// propose step to derive tightened packs. 0600.
+func BehaviourProfilePath() string { return filepath.Join(Dir(), "behaviour-profile.json") }
 
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())

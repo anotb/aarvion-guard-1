@@ -135,8 +135,15 @@ func classifyWebFetch(p map[string]any) Action {
 
 	a := Action{Surface: "api", Verb: verbForMethod(method)}
 	if rawURL != "" {
-		a.Targets = []string{rawURL}
 		a.Host = hostOf(rawURL)
+		// Target on the host (the unit a host allowlist gates), not the full URL,
+		// so an api-guard {NotTargets: host_allowlist} rule can actually fire. The
+		// full URL is retained in Raw for forensics.
+		if a.Host != "" {
+			a.Targets = []string{a.Host}
+		} else {
+			a.Targets = []string{rawURL}
+		}
 		a.Raw = bound(rawURL)
 	}
 	if isDestructiveMethod(method) {

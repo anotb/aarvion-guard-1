@@ -119,6 +119,12 @@ type Rule struct {
 	Verdict     Verdict `json:"verdict"`
 	Reason      string  `json:"reason,omitempty"`
 	Enabled     bool    `json:"enabled"`
+	// Observe marks a rule as recorded-only. It is validated and returned by
+	// Match exactly like any enabled rule (verdict is still deny/ask, so the
+	// tighten-only invariant is unchanged), but the caller records the would-be
+	// verdict as non-enforcing and leaves the effective decision ALLOW. Default
+	// false means the rule enforces normally.
+	Observe bool `json:"observe,omitempty"`
 }
 
 // file is the on-disk representation: {"rules":[...]}.

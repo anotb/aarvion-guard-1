@@ -1,0 +1,50 @@
+{
+  "packs": {
+    "api-guard": {
+      "mode": "observe",
+      "params": {
+        "block_destructive": true,
+        "host_allowlist": []
+      }
+    },
+    "comms-guard": {
+      "mode": "observe",
+      "params": {
+        "channels": [],
+        "quiet_hours": {
+          "days": [],
+          "end": "07:00",
+          "start": "23:00"
+        },
+        "recipient_allowlist": []
+      }
+    },
+    "dlp-guard": {
+      "mode": "observe",
+      "params": {
+        "ask_on_pii": true,
+        "block_secrets": true
+      }
+    },
+    "github-guard": {
+      "mode": "observe"
+    },
+    "google-guard": {
+      "mode": "observe",
+      "params": {
+        "allow_calendar_read": true,
+        "contact_allowlist": []
+      }
+    },
+    "infra-guard": {
+      "mode": "observe"
+    },
+    "social-guard": {
+      "mode": "observe",
+      "params": {
+        "accounts": [],
+        "allow_read": true
+      }
+    }
+  }
+}

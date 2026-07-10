@@ -694,6 +694,36 @@ func TestTimeWindowZeroNowNeverMatches(t *testing.T) {
 	}
 }
 
+func TestObserveRuleValidatesAndMatches(t *testing.T) {
+	// An Observe rule is an ordinary enabled rule as far as overlay is
+	// concerned: it must validate (verdict still deny/ask, so tighten-only
+	// holds) and be returned by Match. The caller (govern.decide) is the one
+	// that reads Observe to record WouldBe and leave the effective decision
+	// ALLOW; overlay itself does not special-case it.
+	s := newStore(t, []Rule{
+		{ID: "obs", Verdict: VerdictDeny, Enabled: true, Observe: true,
+			Match: Match{Surfaces: []string{"twitter"}, Verbs: []string{"post"}}},
+	})
+	r, ok := s.Match(Action{Surface: "twitter", Verb: "post"})
+	if !ok {
+		t.Fatal("an Observe rule should still be returned by Match")
+	}
+	if !r.Observe {
+		t.Fatalf("Observe flag lost through Match: %+v", r)
+	}
+	if r.Verdict != VerdictDeny {
+		t.Fatalf("Observe rule verdict = %q want deny", r.Verdict)
+	}
+
+	// Observe must survive a JSON round-trip and default to false when absent.
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := s.Rules(); len(got) != 1 || !got[0].Observe {
+		t.Fatalf("Observe did not survive round-trip: %+v", got)
+	}
+}
+
 func TestSemanticFacetsAreTightenOnly(t *testing.T) {
 	// Adding semantic facets must not weaken the tighten-only invariant:
 	// a rule using new facets with a non-tighten verdict is still rejected.

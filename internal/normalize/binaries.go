@@ -225,8 +225,13 @@ func matchCurl(a []string, bin string) Action {
 		act.setFlag("delete_verb")
 	}
 	if u := firstURL(a); u != "" {
-		act.Targets = []string{u}
 		act.Host = hostOf(u)
+		// Target on the host, not the full URL, so a host allowlist can gate it.
+		if act.Host != "" {
+			act.Targets = []string{act.Host}
+		} else {
+			act.Targets = []string{u}
+		}
 		act.Account = ""
 	}
 	return act

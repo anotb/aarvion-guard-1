@@ -1,0 +1,16 @@
+{
+  "id": "aarvion-guard",
+  "name": "Aarvion Guard",
+  "description": "Governs agent tool calls through the local Aarvion guard policy decision point (PDP).",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "trustedToolPolicies": ["aarvion-guard"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

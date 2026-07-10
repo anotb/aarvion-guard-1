@@ -1,0 +1,26 @@
+{
+  "name": "@aarvion/openclaw-guard",
+  "version": "0.1.0",
+  "description": "Aarvion guard PEP for OpenClaw: governs agent tool calls via a local policy decision point. Installs into a stock OpenClaw with `openclaw plugin install` - no OpenClaw source changes, no rebuild.",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": ["dist", "openclaw.plugin.json", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "install": {
+      "npmSpec": "@aarvion/openclaw-guard",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.11"
+    }
+  }
+}

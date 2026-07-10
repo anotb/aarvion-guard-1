@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -128,6 +129,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		cmdInit(os.Args[2:])
+	case "onboard":
+		cmdOnboard(os.Args[2:])
 	case "run":
 		cmdRun()
 	case "exec":
@@ -154,6 +157,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `aarvion-guard — govern your local OpenClaw
 
 usage:
+  aarvion-guard onboard <pairing-code>    # one-command: pair + guard + plugin + govern OpenClaw
   aarvion-guard init <pairing-code> [--api URL] [--device NAME] [--transparent]
   aarvion-guard run                       # start the guard (root for --transparent)
   aarvion-guard exec -- <cmd...>          # run OpenClaw inside the governed group
@@ -279,6 +283,194 @@ func cmdInit(args []string) {
 	if runtime.GOOS == "darwin" {
 		fmt.Println("  launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway")
 	}
+}
+
+// cmdOnboard is the one-command path (`npx @aarvionai/guard onboard <code>`): it
+// pairs, provisions the govern PDP socket, starts the guard service, installs +
+// enables the OpenClaw plugin, writes the plugin's env, and restarts the gateway.
+// Re-running is safe: an existing pairing is reused and every step is idempotent.
+func cmdOnboard(args []string) {
+	fs := flag.NewFlagSet("onboard", flag.ExitOnError)
+	apiURL := fs.String("api", defaultAPIURL, "Aarvion backend base URL")
+	device := fs.String("device", "", "device name for this guard")
+	noInspect := fs.Bool("no-inspect", false, "govern HTTPS at host level only (no MITM, no CA trust)")
+	tools := fs.String("tools", "actions", "governed tool set: actions|all|exec")
+	failMode := fs.String("fail-mode", "closed", "verdict when the guard is unreachable: closed|open")
+	pluginSpec := fs.String("plugin", "@aarvion/openclaw-guard", "OpenClaw plugin package spec or local path")
+	link := fs.Bool("link", false, "install the plugin from a local path with --link (dev)")
+	noPlugin := fs.Bool("no-plugin", false, "skip installing the OpenClaw plugin")
+
+	positional := parseInterspersed(fs, args)
+
+	// Pair, or reuse an existing pairing (idempotent re-onboard).
+	var cfg *config.Config
+	if config.Exists() {
+		c, err := config.Load()
+		if err != nil {
+			fatal(err)
+		}
+		cfg = c
+		fmt.Printf("already paired as entity %s — re-onboarding\n", cfg.EntityID)
+	} else {
+		if len(positional) < 1 {
+			fmt.Fprintln(os.Stderr, "error: pairing code required (get one from your Aarvion dashboard)")
+			os.Exit(2)
+		}
+		fmt.Println("pairing with Aarvion...")
+		creds, err := pair.Claim(context.Background(), *apiURL, positional[0], *device)
+		if err != nil {
+			fatal(err)
+		}
+		cfg = &config.Config{
+			Tenant:          creds.Tenant,
+			EntityID:        creds.EntityID,
+			CPUrl:           creds.CPUrl,
+			EnrollmentToken: creds.EnrollmentToken,
+			SigningSecret:   creds.SigningSecret,
+			BundleURL:       creds.BundleURL,
+			DPID:            creds.EntityID + "-" + shortID(),
+			Mode:            config.ModeForward,
+			ProxyAddr:       defaultProxyAddr,
+			TransparentAddr: config.DefaultTransparentAddr,
+			GuardGroup:      config.DefaultGuardGroup,
+			OPAAddr:         defaultOPAAddr,
+			Inspect:         !*noInspect,
+		}
+	}
+
+	// Provision the govern PDP socket so the plugin has an endpoint to call.
+	if cfg.Govern.Socket.Path == "" {
+		cfg.Govern.Socket.Path = filepath.Join(config.Dir(), "govern.sock")
+	}
+	if cfg.Govern.Socket.Token == "" {
+		cfg.Govern.Socket.Token = randomSecret()
+	}
+	cfg.Govern.Socket.PeerUID = onboardPeerUID()
+	if cfg.Govern.FailMode == nil {
+		cfg.Govern.FailMode = map[string]string{}
+	}
+	for _, surface := range []string{"exec", "tool", "egress", "send", "mcp", "response"} {
+		if cfg.Govern.FailMode[surface] == "" {
+			cfg.Govern.FailMode[surface] = *failMode
+		}
+	}
+	if err := cfg.Save(); err != nil {
+		fatal(err)
+	}
+	if err := opa.RenderConfig(cfg); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\npaired as entity %s (tenant %s); govern socket → %s\n", cfg.EntityID, cfg.Tenant, cfg.Govern.Socket.Path)
+
+	// Trust the guard CA (inspect mode only). Non-fatal.
+	caEnv := ""
+	if cfg.Inspect {
+		if _, err := ca.EnsureCA(config.CADir()); err != nil {
+			fatal(err)
+		}
+		caEnv = caCertPath()
+		if err := trust.Install(caEnv); err != nil {
+			fmt.Printf("! could not trust the guard CA: %v (continuing; HTTPS bodies won't be inspected)\n", err)
+		} else {
+			fmt.Println("trusted the guard CA")
+		}
+	}
+
+	// Wire OpenClaw's env: egress proxy + the OPENCLAW_GUARD_* the plugin reads.
+	envPath := wiring.ServiceEnvPath(cfg.OpenClawHome)
+	openclawPresent := envPath != ""
+	if !openclawPresent {
+		fmt.Println("! OpenClaw not found under ~/.openclaw — skipping plugin + gateway wiring.")
+		fmt.Printf("  Install OpenClaw, then re-run `%s onboard`.\n", guardCmd())
+	} else {
+		if err := wiring.InjectProxy(envPath, "http://"+cfg.ProxyAddr, caEnv); err != nil {
+			fmt.Printf("! could not wire egress proxy: %v\n", err)
+		}
+		if err := wiring.InjectGuardEnv(envPath, cfg.Govern.Socket.Path, cfg.Govern.Socket.Token, *failMode, *tools); err != nil {
+			fmt.Printf("! could not write guard env: %v\n", err)
+		} else {
+			fmt.Printf("wired OpenClaw → guard (%s)\n", envPath)
+		}
+	}
+
+	// Install + start the guard service (this is what opens the PDP socket).
+	if err := svc.Install(); err != nil {
+		fmt.Printf("! could not install the guard service: %v\n  start it yourself: %s run\n", err, guardCmd())
+	} else {
+		fmt.Println("guard service running (starts at login, restarts on crash)")
+	}
+
+	// Install + enable the OpenClaw plugin (the PEP).
+	switch {
+	case *noPlugin:
+		fmt.Println("skipped the OpenClaw plugin (--no-plugin)")
+	case !openclawPresent:
+		// already messaged above
+	default:
+		if _, err := exec.LookPath("openclaw"); err != nil {
+			fmt.Println("! `openclaw` not on PATH — install the plugin yourself:")
+			fmt.Printf("    openclaw plugins install %s && openclaw plugins enable aarvion-guard\n", *pluginSpec)
+		} else {
+			installArgs := []string{"plugins", "install", *pluginSpec}
+			if *link {
+				installArgs = append(installArgs, "--link")
+			}
+			runOpenclaw(installArgs...)
+			runOpenclaw("plugins", "enable", "aarvion-guard")
+		}
+	}
+
+	// Restart the gateway so it re-reads the env + loads the plugin.
+	if openclawPresent {
+		restartOpenClawGateway()
+	}
+
+	fmt.Println("\n✓ governance is live — the next tool your agent runs is checked by the guard.")
+	fmt.Println("  see decisions and edit policy in your Aarvion dashboard.")
+}
+
+// randomSecret returns a 32-byte hex secret for the local govern socket token.
+func randomSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// onboardPeerUID is the uid the OpenClaw process runs as, which the govern PDP
+// requires the connecting peer to match. Under sudo, prefer the invoking user.
+func onboardPeerUID() uint32 {
+	if s := os.Getenv("SUDO_UID"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			return uint32(n)
+		}
+	}
+	return uint32(os.Getuid())
+}
+
+// runOpenclaw shells out to the openclaw CLI, streaming output and tolerating
+// "already installed/enabled" so onboard stays idempotent.
+func runOpenclaw(args ...string) {
+	cmd := exec.Command("openclaw", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("! openclaw %s: %v (safe to ignore if already installed/enabled)\n", strings.Join(args, " "), err)
+	}
+}
+
+// restartOpenClawGateway restarts OpenClaw so it picks up the new env + plugin.
+func restartOpenClawGateway() {
+	if runtime.GOOS != "darwin" {
+		fmt.Println("restart your OpenClaw gateway to pick up the changes.")
+		return
+	}
+	uid := strconv.Itoa(os.Getuid())
+	if err := exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/ai.openclaw.gateway").Run(); err != nil {
+		fmt.Println("! could not restart the OpenClaw gateway; do it manually:")
+		fmt.Printf("    launchctl kickstart -k gui/%s/ai.openclaw.gateway\n", uid)
+		return
+	}
+	fmt.Println("restarted the OpenClaw gateway")
 }
 
 func cmdRun() {

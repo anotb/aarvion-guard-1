@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newStore(t *testing.T, rules []Rule) *Store {
@@ -441,5 +442,307 @@ func TestOnDiskFormat(t *testing.T) {
 	}
 	if len(f.Rules) != 1 || f.Rules[0].ID != "a" {
 		t.Fatalf("unexpected on-disk contents: %+v", f)
+	}
+}
+
+// --- semantic facets (Task A3) ---
+
+func TestSurfacesFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{Surfaces: []string{"twitter", "comms"}}},
+	})
+	if _, ok := s.Match(Action{Surface: "twitter"}); !ok {
+		t.Fatal("expected surface match")
+	}
+	if _, ok := s.Match(Action{Surface: "TWITTER"}); !ok {
+		t.Fatal("surface match should be case-insensitive")
+	}
+	if _, ok := s.Match(Action{Surface: "github"}); ok {
+		t.Fatal("github must not match a twitter/comms surface rule")
+	}
+}
+
+func TestVerbsFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{
+				Surfaces: []string{"twitter"},
+				Verbs:    []string{"post", "reply", "dm", "follow"},
+			}},
+	})
+	// A post on twitter matches (surface AND verb).
+	if _, ok := s.Match(Action{Surface: "twitter", Verb: "post"}); !ok {
+		t.Fatal("expected match for twitter post")
+	}
+	if _, ok := s.Match(Action{Surface: "twitter", Verb: "REPLY"}); !ok {
+		t.Fatal("verb match should be case-insensitive")
+	}
+	// A read on twitter does NOT match (verb facet excludes read).
+	if _, ok := s.Match(Action{Surface: "twitter", Verb: "read"}); ok {
+		t.Fatal("twitter read must not match a post/reply/dm/follow rule")
+	}
+	// Right verb, wrong surface -> no match (AND across facets).
+	if _, ok := s.Match(Action{Surface: "github", Verb: "post"}); ok {
+		t.Fatal("wrong surface must not match even with a matching verb")
+	}
+}
+
+func TestPrincipalsFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{Principals: []string{"llm-twitter"}}},
+	})
+	if _, ok := s.Match(Action{Principal: "llm-twitter"}); !ok {
+		t.Fatal("expected principal match")
+	}
+	if _, ok := s.Match(Action{Principal: "LLM-Twitter"}); !ok {
+		t.Fatal("principal match should be case-insensitive")
+	}
+	if _, ok := s.Match(Action{Principal: "main"}); ok {
+		t.Fatal("a different principal must not match")
+	}
+	if _, ok := s.Match(Action{}); ok {
+		t.Fatal("empty principal must not match a principals rule")
+	}
+}
+
+func TestChannelsFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{Channels: []string{"telegram", "discord"}}},
+	})
+	if _, ok := s.Match(Action{Channel: "telegram"}); !ok {
+		t.Fatal("expected channel match")
+	}
+	if _, ok := s.Match(Action{Channel: "Discord"}); !ok {
+		t.Fatal("channel match should be case-insensitive")
+	}
+	if _, ok := s.Match(Action{Channel: "whatsapp"}); ok {
+		t.Fatal("whatsapp must not match a telegram/discord rule")
+	}
+}
+
+func TestFlagsAllFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{FlagsAll: []string{"force", "destructive"}}},
+	})
+	// Both flags true -> match (AND).
+	if _, ok := s.Match(Action{Flags: map[string]bool{"force": true, "destructive": true}}); !ok {
+		t.Fatal("expected match when all named flags are true")
+	}
+	// Only one flag true -> no match.
+	if _, ok := s.Match(Action{Flags: map[string]bool{"force": true}}); ok {
+		t.Fatal("must not match when only some named flags are true")
+	}
+	// A flag present but false -> no match.
+	if _, ok := s.Match(Action{Flags: map[string]bool{"force": true, "destructive": false}}); ok {
+		t.Fatal("a false flag must not satisfy FlagsAll")
+	}
+	// Nil flags -> no match.
+	if _, ok := s.Match(Action{}); ok {
+		t.Fatal("nil flags must not match a FlagsAll rule")
+	}
+}
+
+func TestFindingsAnyFacet(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{FindingsAny: []string{"secret:ghp", "secret:aws"}}},
+	})
+	// Any listed label present -> match (OR).
+	if _, ok := s.Match(Action{Findings: []string{"pii:email", "secret:ghp"}}); !ok {
+		t.Fatal("expected match when a listed finding is present")
+	}
+	// No listed label -> no match.
+	if _, ok := s.Match(Action{Findings: []string{"pii:email"}}); ok {
+		t.Fatal("must not match when no listed finding is present")
+	}
+	// Empty findings -> no match.
+	if _, ok := s.Match(Action{}); ok {
+		t.Fatal("empty findings must not match a FindingsAny rule")
+	}
+}
+
+func TestFindingsAnyCaseInsensitive(t *testing.T) {
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{FindingsAny: []string{"Secret:GHP"}}},
+	})
+	if _, ok := s.Match(Action{Findings: []string{"secret:ghp"}}); !ok {
+		t.Fatal("findings match should be case-insensitive")
+	}
+}
+
+func TestNotTargetsFacet(t *testing.T) {
+	// NotTargets is a recipient/host allowlist inversion: it matches (fires)
+	// when NONE of the action's targets is in the allowlist.
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictDeny, Enabled: true,
+			Match: Match{NotTargets: []string{"a@x.com", "b@x.com"}}},
+	})
+	// Recipient not in the allowlist -> fires.
+	if _, ok := s.Match(Action{Targets: []string{"stranger@y.com"}}); !ok {
+		t.Fatal("expected fire when target is outside the allowlist")
+	}
+	// Recipient in the allowlist -> does not fire.
+	if _, ok := s.Match(Action{Targets: []string{"a@x.com"}}); ok {
+		t.Fatal("must not fire when target is in the allowlist")
+	}
+	// Case-insensitive allowlist membership.
+	if _, ok := s.Match(Action{Targets: []string{"A@X.com"}}); ok {
+		t.Fatal("allowlist membership should be case-insensitive")
+	}
+	// ANY target in the allowlist means the action is allowed (does not fire).
+	if _, ok := s.Match(Action{Targets: []string{"stranger@y.com", "a@x.com"}}); ok {
+		t.Fatal("a single allowlisted target must spare the whole action")
+	}
+	// Empty targets -> does NOT match (avoid blocking targetless actions).
+	if _, ok := s.Match(Action{}); ok {
+		t.Fatal("empty targets must not match a NotTargets rule")
+	}
+}
+
+func TestTimeWindowFacetWraparound(t *testing.T) {
+	// Quiet hours 23:00-07:00 (wraps midnight).
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{TimeWindow: &Window{Start: "23:00", End: "07:00"}}},
+	})
+	at := func(h, m int) Action {
+		return Action{Now: time.Date(2026, 7, 10, h, m, 0, 0, time.Local)}
+	}
+	// 02:00 is inside the quiet window.
+	if _, ok := s.Match(at(2, 0)); !ok {
+		t.Fatal("02:00 should be inside 23:00-07:00")
+	}
+	// 23:30 is inside.
+	if _, ok := s.Match(at(23, 30)); !ok {
+		t.Fatal("23:30 should be inside 23:00-07:00")
+	}
+	// 12:00 is outside.
+	if _, ok := s.Match(at(12, 0)); ok {
+		t.Fatal("12:00 should be outside 23:00-07:00")
+	}
+	// 07:00 is the exclusive end -> outside.
+	if _, ok := s.Match(at(7, 0)); ok {
+		t.Fatal("07:00 (end) should be outside the window")
+	}
+	// 23:00 is the inclusive start -> inside.
+	if _, ok := s.Match(at(23, 0)); !ok {
+		t.Fatal("23:00 (start) should be inside the window")
+	}
+}
+
+func TestTimeWindowFacetSameDay(t *testing.T) {
+	// A non-wrapping window 09:00-17:00.
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{TimeWindow: &Window{Start: "09:00", End: "17:00"}}},
+	})
+	at := func(h, m int) Action {
+		return Action{Now: time.Date(2026, 7, 10, h, m, 0, 0, time.Local)}
+	}
+	if _, ok := s.Match(at(12, 0)); !ok {
+		t.Fatal("12:00 should be inside 09:00-17:00")
+	}
+	if _, ok := s.Match(at(8, 0)); ok {
+		t.Fatal("08:00 should be outside 09:00-17:00")
+	}
+	if _, ok := s.Match(at(18, 0)); ok {
+		t.Fatal("18:00 should be outside 09:00-17:00")
+	}
+}
+
+func TestTimeWindowFacetDays(t *testing.T) {
+	// 2026-07-10 is a Friday.
+	friday := time.Date(2026, 7, 10, 2, 0, 0, 0, time.Local)
+	saturday := time.Date(2026, 7, 11, 2, 0, 0, 0, time.Local)
+
+	// Restricted to Fridays only.
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{TimeWindow: &Window{Start: "23:00", End: "07:00", Days: []string{"fri"}}}},
+	})
+	if _, ok := s.Match(Action{Now: friday}); !ok {
+		t.Fatal("Friday 02:00 should match a fri-only window")
+	}
+	if _, ok := s.Match(Action{Now: saturday}); ok {
+		t.Fatal("Saturday 02:00 should NOT match a fri-only window")
+	}
+
+	// Full day name also accepted, case-insensitive.
+	s2 := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{TimeWindow: &Window{Start: "23:00", End: "07:00", Days: []string{"Friday"}}}},
+	})
+	if _, ok := s2.Match(Action{Now: friday}); !ok {
+		t.Fatal("full day name 'Friday' should match")
+	}
+}
+
+func TestTimeWindowZeroNowNeverMatches(t *testing.T) {
+	// A rule with only a TimeWindow but a zero Action.Now must not match,
+	// so an action that never populated Now is not silently gated.
+	s := newStore(t, []Rule{
+		{ID: "r1", Verdict: VerdictAsk, Enabled: true,
+			Match: Match{TimeWindow: &Window{Start: "23:00", End: "07:00"}}},
+	})
+	if _, ok := s.Match(Action{}); ok {
+		t.Fatal("a zero Now must not match a TimeWindow rule")
+	}
+}
+
+func TestSemanticFacetsAreTightenOnly(t *testing.T) {
+	// Adding semantic facets must not weaken the tighten-only invariant:
+	// a rule using new facets with a non-tighten verdict is still rejected.
+	path := filepath.Join(t.TempDir(), "overlay.json")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Replace([]Rule{
+		{ID: "loose", Verdict: Verdict("allow"), Enabled: true,
+			Match: Match{Surfaces: []string{"twitter"}}},
+	}); err == nil {
+		t.Fatal("expected rejection of verdict 'allow' on a semantic-facet rule")
+	}
+}
+
+func TestSemanticFacetsJSONRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "overlay.json")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []Rule{
+		{ID: "sem", Verdict: VerdictDeny, Enabled: true, Match: Match{
+			Surfaces:    []string{"twitter"},
+			Verbs:       []string{"post"},
+			Principals:  []string{"llm-twitter"},
+			Channels:    []string{"telegram"},
+			FlagsAll:    []string{"force"},
+			FindingsAny: []string{"secret:ghp"},
+			NotTargets:  []string{"a@x.com"},
+			TimeWindow:  &Window{Start: "23:00", End: "07:00", Days: []string{"fri"}},
+		}},
+	}
+	if err := s.Replace(rules); err != nil {
+		t.Fatalf("Replace semantic rule: %v", err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	got := s.Rules()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 rule after round-trip, got %d", len(got))
+	}
+	m := got[0].Match
+	if len(m.Surfaces) != 1 || m.Surfaces[0] != "twitter" {
+		t.Fatalf("Surfaces did not survive round-trip: %+v", m.Surfaces)
+	}
+	if m.TimeWindow == nil || m.TimeWindow.Start != "23:00" || m.TimeWindow.End != "07:00" {
+		t.Fatalf("TimeWindow did not survive round-trip: %+v", m.TimeWindow)
 	}
 }

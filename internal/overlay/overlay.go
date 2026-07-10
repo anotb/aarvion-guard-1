@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Verdict is the outcome an overlay rule can impose. Tighten-only: the only
@@ -32,6 +33,10 @@ const (
 )
 
 // Action is the concrete action being judged against the overlay rules.
+//
+// The first block of fields are the original network/tool facets. The second
+// block are the semantic facets produced by the normalizer (surface/verb/etc.),
+// consumed by the semantic Match facets below.
 type Action struct {
 	Tool    string
 	Command string
@@ -39,6 +44,16 @@ type Action struct {
 	Method  string
 	Path    string
 	Surface string
+
+	// Semantic facets (populated by internal/normalize on the PDP path).
+	Verb      string          // send|read|delete|share|post|reply|dm|follow|push|...
+	Binary    string          // gog|bird|gh|git|curl|docker|... ("" for native tools)
+	Channel   string          // telegram|discord|whatsapp|reddit|...
+	Principal string          // caller principal_id
+	Targets   []string        // recipients / repo / file id / host
+	Findings  []string        // DLP labels: "secret:ghp"|"pii:email"|...
+	Flags     map[string]bool // force|external_recipient|public_share|destructive|...
+	Now       time.Time       // evaluation time, for time-window facets
 }
 
 // Match describes the facets a rule tests against an Action. A rule matches
@@ -57,6 +72,43 @@ type Match struct {
 	HostSuffixes []string `json:"host_suffixes,omitempty"`
 	// Methods matches Action.Method by exact HTTP method, case-insensitive.
 	Methods []string `json:"methods,omitempty"`
+
+	// --- semantic facets (Task A3) ---
+
+	// Surfaces matches Action.Surface by exact name, case-insensitive (OR).
+	Surfaces []string `json:"surfaces,omitempty"`
+	// Verbs matches Action.Verb by exact name, case-insensitive (OR).
+	Verbs []string `json:"verbs,omitempty"`
+	// Principals matches Action.Principal (caller principal_id) by exact name,
+	// case-insensitive (OR).
+	Principals []string `json:"principals,omitempty"`
+	// Channels matches Action.Channel by exact name, case-insensitive (OR).
+	Channels []string `json:"channels,omitempty"`
+	// FlagsAll matches only when EVERY named flag is present and true in
+	// Action.Flags (AND).
+	FlagsAll []string `json:"flags_all,omitempty"`
+	// FindingsAny matches when ANY listed DLP label is present in
+	// Action.Findings, case-insensitive (OR).
+	FindingsAny []string `json:"findings_any,omitempty"`
+	// NotTargets is a recipient/host allowlist inversion: it matches when NONE
+	// of Action.Targets is in this set (case-insensitive). If Action.Targets is
+	// empty it does NOT match, so targetless actions are never blocked by it.
+	NotTargets []string `json:"not_targets,omitempty"`
+	// TimeWindow matches when Action.Now (local time) falls inside the window,
+	// handling midnight wraparound. A zero Action.Now never matches.
+	TimeWindow *Window `json:"time_window,omitempty"`
+}
+
+// Window is a wall-clock time window used by the TimeWindow facet (e.g. quiet
+// hours). Start and End are "HH:MM" 24-hour local times; the window is
+// [Start, End) and wraps across midnight when End <= Start (e.g. 23:00-07:00).
+// Days optionally restricts the window to given weekdays; empty means every
+// day. Day entries are matched case-insensitively as lowercased 3-letter
+// (mon..sun) or full names (monday..sunday).
+type Window struct {
+	Start string   `json:"start"`
+	End   string   `json:"end"`
+	Days  []string `json:"days,omitempty"`
 }
 
 // Rule is a single overlay policy entry.
@@ -180,8 +232,7 @@ func (s *Store) Match(a Action) (Rule, bool) {
 // within a facet, any entry matching suffices (OR). An all-empty Match never
 // matches.
 func (m Match) matches(a Action) bool {
-	if len(m.Tools) == 0 && len(m.CommandContains) == 0 &&
-		len(m.HostSuffixes) == 0 && len(m.Methods) == 0 {
+	if m.empty() {
 		return false
 	}
 
@@ -197,7 +248,42 @@ func (m Match) matches(a Action) bool {
 	if len(m.Methods) > 0 && !matchMethods(m.Methods, a.Method) {
 		return false
 	}
+	// Semantic facets (AND across facets, OR within each unless noted).
+	if len(m.Surfaces) > 0 && !matchEqualFoldAny(m.Surfaces, a.Surface) {
+		return false
+	}
+	if len(m.Verbs) > 0 && !matchEqualFoldAny(m.Verbs, a.Verb) {
+		return false
+	}
+	if len(m.Principals) > 0 && !matchEqualFoldAny(m.Principals, a.Principal) {
+		return false
+	}
+	if len(m.Channels) > 0 && !matchEqualFoldAny(m.Channels, a.Channel) {
+		return false
+	}
+	if len(m.FlagsAll) > 0 && !matchFlagsAll(m.FlagsAll, a.Flags) {
+		return false
+	}
+	if len(m.FindingsAny) > 0 && !matchFindingsAny(m.FindingsAny, a.Findings) {
+		return false
+	}
+	if len(m.NotTargets) > 0 && !matchNotTargets(m.NotTargets, a.Targets) {
+		return false
+	}
+	if m.TimeWindow != nil && !m.TimeWindow.matches(a.Now) {
+		return false
+	}
 	return true
+}
+
+// empty reports whether no facet is populated. An empty Match never matches.
+func (m Match) empty() bool {
+	return len(m.Tools) == 0 && len(m.CommandContains) == 0 &&
+		len(m.HostSuffixes) == 0 && len(m.Methods) == 0 &&
+		len(m.Surfaces) == 0 && len(m.Verbs) == 0 &&
+		len(m.Principals) == 0 && len(m.Channels) == 0 &&
+		len(m.FlagsAll) == 0 && len(m.FindingsAny) == 0 &&
+		len(m.NotTargets) == 0 && m.TimeWindow == nil
 }
 
 // matchTools matches tool name exactly (case-sensitive).
@@ -252,6 +338,116 @@ func matchMethods(methods []string, method string) bool {
 		}
 	}
 	return false
+}
+
+// matchEqualFoldAny reports whether value equals any listed entry,
+// case-insensitively. An empty value never matches (so an unset facet on the
+// action does not satisfy a populated rule facet).
+func matchEqualFoldAny(list []string, value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, e := range list {
+		if strings.EqualFold(e, value) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchFlagsAll reports whether every named flag is present and true in flags.
+func matchFlagsAll(names []string, flags map[string]bool) bool {
+	for _, n := range names {
+		if !flags[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// matchFindingsAny reports whether any listed label is present in findings,
+// compared case-insensitively (OR).
+func matchFindingsAny(labels, findings []string) bool {
+	for _, want := range labels {
+		for _, f := range findings {
+			if strings.EqualFold(want, f) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchNotTargets implements the recipient/host allowlist inversion. It matches
+// when NONE of targets is in the allowlist (case-insensitive). Empty targets
+// never match, so a targetless action is never blocked by a NotTargets facet.
+func matchNotTargets(allowlist, targets []string) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	for _, t := range targets {
+		for _, allowed := range allowlist {
+			if strings.EqualFold(t, allowed) {
+				// A target is on the allowlist: spare the whole action.
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// matches reports whether now (interpreted in its own location) falls inside
+// the window [Start, End), handling midnight wraparound, and on an allowed day.
+// A zero now never matches.
+func (w *Window) matches(now time.Time) bool {
+	if now.IsZero() {
+		return false
+	}
+	if !w.dayAllowed(now.Weekday()) {
+		return false
+	}
+	start, okS := parseHHMM(w.Start)
+	end, okE := parseHHMM(w.End)
+	if !okS || !okE {
+		return false
+	}
+	cur := now.Hour()*60 + now.Minute()
+	if start == end {
+		// Zero-width window matches nothing.
+		return false
+	}
+	if start < end {
+		// Same-day window [start, end).
+		return cur >= start && cur < end
+	}
+	// Wraparound window, e.g. 23:00-07:00: inside if at/after start OR before end.
+	return cur >= start || cur < end
+}
+
+// dayAllowed reports whether d is permitted by the window's Days list. An empty
+// list means every day.
+func (w *Window) dayAllowed(d time.Weekday) bool {
+	if len(w.Days) == 0 {
+		return true
+	}
+	short := strings.ToLower(d.String()[:3]) // "mon".."sun"
+	full := strings.ToLower(d.String())      // "monday".."sunday"
+	for _, e := range w.Days {
+		le := strings.ToLower(strings.TrimSpace(e))
+		if le == short || le == full {
+			return true
+		}
+	}
+	return false
+}
+
+// parseHHMM parses a "HH:MM" 24-hour time into minutes-since-midnight.
+func parseHHMM(s string) (int, bool) {
+	t, err := time.Parse("15:04", strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	return t.Hour()*60 + t.Minute(), true
 }
 
 // validate enforces the tighten-only invariant and ID rules.

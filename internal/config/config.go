@@ -36,6 +36,27 @@ type Config struct {
 	Learn         Learn         `json:"learn,omitempty"`
 	Control       Control       `json:"control,omitempty"`
 	Console       Console       `json:"console,omitempty"`
+	Approve       Approve       `json:"approve,omitempty"`
+}
+
+// Approve configures the human-in-the-loop approver behind an `ask` verdict.
+// When the PDP escalates an action for confirmation it opens a pending, notifies
+// the owner over Telegram (inline Approve/Deny buttons) and surfaces it in the
+// console inbox; the PEP polls the guard until it resolves or the TTL expires
+// (deny, fail-safe). When Enabled is false (or the struct is absent) no approver
+// is built and an `ask` verdict behaves as it does today.
+//
+//   - TimeoutSeconds: how long a pending stays open before the reaper denies it
+//     (fail-safe). A non-positive value means the caller's default applies.
+//   - Telegram: bot credentials for the owner-notification channel. BotToken and
+//     ChatID are secrets, so the config file that holds them stays 0600.
+type Approve struct {
+	Enabled        bool `json:"enabled"`
+	TimeoutSeconds int  `json:"timeout_seconds,omitempty"`
+	Telegram       struct {
+		BotToken string `json:"bot_token,omitempty"`
+		ChatID   string `json:"chat_id,omitempty"`
+	} `json:"telegram,omitempty"`
 }
 
 // Console configures the local governance dashboard: a loopback-only HTTP UI for
@@ -223,6 +244,12 @@ func DecisionsLogPath() string { return filepath.Join(Dir(), "decisions.jsonl") 
 // agent actually does per {principal,surface,verb}, used by the console and the
 // propose step to derive tightened packs. 0600.
 func BehaviourProfilePath() string { return filepath.Join(Dir(), "behaviour-profile.json") }
+
+// PendingDir is the optional on-disk mirror of the approver's pending set: one
+// 0600 JSON file per open decision under a 0700 dir, written best-effort so a
+// crash leaves the outstanding approvals visible. The in-memory store remains
+// authoritative.
+func PendingDir() string { return filepath.Join(Dir(), "pending") }
 
 func Load() (*Config, error) {
 	raw, err := os.ReadFile(Path())

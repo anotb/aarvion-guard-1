@@ -19,6 +19,10 @@ type Decision struct {
 	Reason     string
 	Redactions string
 	Enforced   bool
+	// Verdict is an optional policy-supplied override ("ask"|"redact") carried in
+	// the x-aarvion-verdict header. Empty means the verdict follows Allowed
+	// (allow/deny). Only the govern PDP path acts on it.
+	Verdict string
 }
 
 type Client struct {
@@ -125,6 +129,7 @@ func (c *Client) eval(ctx context.Context, input map[string]any) (*Decision, err
 		Reason:     out.Result.Headers["x-policy-reason"],
 		Redactions: out.Result.Headers["x-aarvion-redactions"],
 		Enforced:   out.Result.Headers["x-aarvion-enforced"] != "false",
+		Verdict:    out.Result.Headers["x-aarvion-verdict"],
 	}
 	if d.HTTPStatus == 0 {
 		if d.Allowed {

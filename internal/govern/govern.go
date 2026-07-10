@@ -217,11 +217,19 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	}
 	latency := int(s.nowFn().Sub(start).Milliseconds())
 
+	// A policy can override the allow/deny verdict via x-aarvion-verdict to request
+	// human-in-the-loop approval ("ask") or field redaction ("redact"). "ask" is
+	// enforced by the PEP (it pauses for owner approval); "redact" is plumbed but
+	// not yet enforced. Absent an override, the verdict follows Allowed.
 	verdict := VerdictAllow
 	decision := "allow"
-	if !dec.Allowed {
-		verdict = VerdictDeny
-		decision = "deny"
+	switch {
+	case dec.Verdict == VerdictAsk:
+		verdict, decision = VerdictAsk, "ask"
+	case dec.Verdict == VerdictRedact:
+		verdict, decision = VerdictRedact, "redact"
+	case !dec.Allowed:
+		verdict, decision = VerdictDeny, "deny"
 	}
 
 	s.rec.AddGoverned(decisions.Record{
@@ -242,7 +250,7 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		CallerSource:      req.Ctx.Caller.Source,
 	})
 
-	return &Response{
+	resp := &Response{
 		DecisionID: newDecisionID(),
 		Nonce:      req.Nonce,
 		Verdict:    verdict,
@@ -251,6 +259,10 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		Reason:     dec.Reason,
 		Redactions: dec.Redactions,
 	}
+	if verdict == VerdictAsk {
+		resp.Ask = &Ask{Prompt: dec.Reason}
+	}
+	return resp
 }
 
 // buildInput assembles the extended OPA input from the request: the http block

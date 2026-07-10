@@ -1,14 +1,34 @@
 # aarvion-guard
 
-Govern your local OpenClaw with Aarvion. A single Go binary that routes
-OpenClaw's egress through a local policy checkpoint (OPA), enforcing the same
-signed policy bundle your dashboard already serves — no agents/MCP surface,
-egress only.
+Govern your local OpenClaw with Aarvion. A single Go binary that enforces a
+signed OPA policy at a local checkpoint, and writes every decision to a
+tamper-evident hash-chain. It governs OpenClaw **two ways**:
 
-This is **P1 / B0**: the forward-proxy skeleton. It proves the full control-plane
+1. **Network egress** — routes OpenClaw's egress through a local forward proxy /
+   transparent redirect and rules on it host-by-host.
+2. **Agent actions** — a local **PDP** (`/v1/govern` over a Unix socket) that an
+   OpenClaw plugin calls *before every tool call* to allow / deny / ask. This is
+   the runtime governance hook ("Option C"): it governs what the agent **does**
+   (shell, github, file writes, sends, web, MCP tools) — not just which hosts it
+   talks to — **without modifying or forking OpenClaw**. See
+   [`clients/openclaw-plugin/`](clients/openclaw-plugin/).
+
+The forward proxy started as **P1 / B0** — proving the full control-plane
 contract from Go (pairing → bundle pull → decision → dashboard) with **zero
 kernel-interception risk**. Transparent, bypass-proof interception is **B1/P2**.
 See `../OPENCLAW_GUARD_B_PLAN.md`.
+
+## Govern agent actions — the runtime hook (Option C)
+
+The network proxy can't see *what an agent is doing* (an agent's own TLS client
+rejects the guard CA, and host-level rules can't tell `git push --force` from
+`git status`). The runtime hook fixes that: OpenClaw's own `trustedToolPolicy`
+seam calls the guard's PDP before each tool runs, so a policy can block a
+dangerous shell command, a force-push, a secret leaving in a message, or an
+egress to a bad host — and **ask** for your approval on the risky-but-maybe-fine
+ones. It ships as an installable plugin (no OpenClaw source changes), backed by
+the same signed OPA engine + hash-chain as the proxy. Quickstart, install, and a
+multi-surface example policy: [`clients/openclaw-plugin/`](clients/openclaw-plugin/).
 
 ## What works today (B0)
 

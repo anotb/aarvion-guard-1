@@ -21,7 +21,7 @@ export interface GuardConfig {
 }
 
 export interface GuardVerdict {
-	verdict: "allow" | "deny";
+	verdict: "allow" | "deny" | "ask";
 	reason?: string;
 	policyId?: string;
 	decisionId?: string;
@@ -204,7 +204,7 @@ function parseVerdict(raw: string): GuardVerdict | null {
 	} catch {
 		return null;
 	}
-	if (parsed.verdict !== "allow" && parsed.verdict !== "deny") return null;
+	if (parsed.verdict !== "allow" && parsed.verdict !== "deny" && parsed.verdict !== "ask") return null;
 	return { verdict: parsed.verdict, reason: parsed.reason, policyId: parsed.policy_id, decisionId: parsed.decision_id };
 }
 

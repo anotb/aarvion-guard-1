@@ -21,8 +21,18 @@ export interface ToolPolicyContext {
 	sessionKey?: string;
 }
 
+/** A human-in-the-loop approval prompt (OpenClaw pauses the tool call for it). */
+export interface ApprovalRequest {
+	title: string;
+	description: string;
+	severity?: "info" | "warning" | "critical";
+	timeoutMs?: number;
+	timeoutBehavior?: "allow" | "deny";
+}
+
 export type ToolPolicyDecision =
 	| { block?: boolean; blockReason?: string; params?: Record<string, unknown> }
+	| { requireApproval: ApprovalRequest }
 	| { allow?: boolean; reason?: string }
 	| void;
 
@@ -56,6 +66,18 @@ export function registerAarvionGuardPlugin(api: GuardHostApi): void {
 			if (verdict.verdict === "deny") {
 				const detail = verdict.reason ?? verdict.policyId ?? "denied";
 				return { block: true, blockReason: `Aarvion guard: ${detail}` };
+			}
+			if (verdict.verdict === "ask") {
+				// Third verdict: pause for owner approval via OpenClaw's native
+				// approval flow. If no one responds it times out to a deny (fail-safe).
+				return {
+					requireApproval: {
+						title: "Aarvion guard — approval required",
+						description: `Aarvion guard: ${verdict.reason ?? "this action needs your approval"}`,
+						severity: "warning",
+						timeoutBehavior: "deny",
+					},
+				};
 			}
 			// No veto -> the guard allowed it (or the tool isn't governed); native
 			// allowlist/approvals still apply.

@@ -200,3 +200,31 @@ func containsLabel(labels []string, want string) bool {
 	}
 	return false
 }
+
+// TestClassifyRealOpenClawShellTool covers the live-caught case: OpenClaw names
+// its shell tool "Bash" (capitalized) and passes the command inside a params map
+// {"command": "..."}, not as a bare string. Classification must still fire so the
+// packs see the real semantic action.
+func TestClassifyRealOpenClawShellTool(t *testing.T) {
+	// "Bash" tool, command in a map -> classified as a twitter post.
+	got := Classify("Bash", map[string]any{"command": "bird tweet hello world"}, "tool")
+	if got.Surface != "twitter" || got.Verb != "post" {
+		t.Fatalf("Bash+map bird tweet = {%q,%q}, want {twitter,post}", got.Surface, got.Verb)
+	}
+	// Case-insensitive + map command for a destructive git op.
+	got = Classify("BASH", map[string]any{"command": "git push --force origin main"}, "exec")
+	if got.Surface != "github" || got.Verb != "force_push" {
+		t.Fatalf("BASH+map force-push = {%q,%q}, want {github,force_push}", got.Surface, got.Verb)
+	}
+	// A secret in the command is still DLP-scanned when it arrives via the map.
+	got = Classify("Bash", map[string]any{"command": "curl -H 'token: ghp_" + "a" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' x"}, "tool")
+	found := false
+	for _, f := range got.Findings {
+		if f == "secret:ghp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Bash+map command with ghp_ token: findings=%v, want secret:ghp", got.Findings)
+	}
+}

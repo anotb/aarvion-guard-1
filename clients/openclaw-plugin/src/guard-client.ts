@@ -63,19 +63,23 @@ function isMcpTool(toolName: string): boolean {
 
 /** Does this tool get sent to the guard under the current mode? */
 export function shouldGovern(toolName: string, mode: GovernMode): boolean {
+	// OpenClaw names its shell tool "Bash" (capitalized); our tables are lowercase,
+	// so match case-insensitively.
+	const t = toolName.toLowerCase();
 	if (mode === "all") return true;
-	if (mode === "exec") return SHELL_TOOLS.has(toolName);
+	if (mode === "exec") return SHELL_TOOLS.has(t);
 	// "actions": everything that could mutate/egress/act - i.e. not a known read-only
 	// tool. All MCP tools are governed (they're external, high-value).
-	return isMcpTool(toolName) || !READONLY_TOOLS.has(toolName);
+	return isMcpTool(toolName) || !READONLY_TOOLS.has(t);
 }
 
 /** Coarse surface tag so the guard's per-surface fail_mode applies correctly. */
 function surfaceFor(toolName: string): string {
-	if (SHELL_TOOLS.has(toolName)) return "exec";
+	const t = toolName.toLowerCase();
+	if (SHELL_TOOLS.has(t)) return "exec";
 	if (isMcpTool(toolName)) return "mcp";
-	if (toolName === "web_fetch") return "egress";
-	if (toolName === "message" || toolName === "sessions_send" || toolName === "nodes") return "send";
+	if (t === "web_fetch") return "egress";
+	if (t === "message" || t === "sessions_send" || t === "nodes") return "send";
 	return "tool";
 }
 
@@ -98,7 +102,7 @@ function boundedArgs(params: Record<string, unknown>): Record<string, unknown> {
 
 /** The literal shell command for a shell tool, if any. */
 function shellCommand(toolName: string, params: Record<string, unknown>): string | undefined {
-	if (!SHELL_TOOLS.has(toolName)) return undefined;
+	if (!SHELL_TOOLS.has(toolName.toLowerCase())) return undefined;
 	return asString(params.command) ?? asString(params.cmd) ?? asString(params.input);
 }
 

@@ -314,13 +314,10 @@ func apiGuardBuiltins(p Pack) []builtin {
 		})
 	}
 
-	// Host allowlist inversion. NOTE (normalizer gap): the normalizer populates
-	// Action.Targets with the FULL URL (see internal/normalize classifyWebFetch
-	// and matchCurl), not the bare host, and sets Action.Host separately. This
-	// NotTargets rule compares the host allowlist against those full-URL targets,
-	// so it will NOT fire as written. The rule is emitted regardless so the shape
-	// is stable and the integrator can extend the normalizer to also push the
-	// host into Targets (or add a NotHosts facet). Flagged in the task notes.
+	// Host allowlist inversion: the api normalizer targets an action on its bare
+	// host (internal/normalize classifyWebFetch + matchCurl put the host in
+	// Action.Targets), so this NotTargets rule fires when the destination host is
+	// not in the allowlist. Covered by TestApiGuardHostAllowlistFires.
 	if allow := ovStringSlice(p.Params, "host_allowlist"); len(allow) > 0 {
 		out = append(out, builtin{
 			match: overlay.Match{

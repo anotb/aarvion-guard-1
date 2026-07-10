@@ -60,14 +60,36 @@ var shellTools = map[string]bool{
 // name; args is the raw args (a string command for shell tools, or a
 // map[string]any of params for native tools); surface is the PEP's coarse tag.
 //
-// Shell tools carry their command as a string and dispatch to the per-binary
-// matchers; everything else is treated as a native tool with structured params.
+// Tool matching is case-insensitive: OpenClaw names its shell tool "Bash", while
+// our tables are lowercase. Shell tools carry their command either as a bare
+// string or inside a params map ({"command": "..."}) — both are handled — and
+// dispatch to the per-binary matchers; everything else is a native tool.
 func Classify(tool string, args any, surface string) Action {
-	if cmd, ok := args.(string); ok && shellTools[tool] {
-		return classifyShell(tool, cmd, surface)
+	lt := strings.ToLower(strings.TrimSpace(tool))
+	if shellTools[lt] {
+		if cmd := shellCommandArg(args); cmd != "" {
+			return classifyShell(lt, cmd, surface)
+		}
 	}
 	params, _ := args.(map[string]any)
-	return classifyNative(tool, params, surface)
+	return classifyNative(lt, params, surface)
+}
+
+// shellCommandArg pulls the shell command out of a shell tool's args, which
+// OpenClaw passes either as a bare string or as a params map keyed by
+// command/cmd/input/script (OpenClaw's "Bash" tool uses "command").
+func shellCommandArg(args any) string {
+	if s, ok := args.(string); ok {
+		return s
+	}
+	if m, ok := args.(map[string]any); ok {
+		for _, k := range []string{"command", "cmd", "input", "script"} {
+			if s, ok := m[k].(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // classifyShell handles shell tools whose args are a raw command string. It

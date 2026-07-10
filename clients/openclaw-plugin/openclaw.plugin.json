@@ -6,7 +6,7 @@
     "onStartup": true
   },
   "contracts": {
-    "trustedToolPolicies": ["aarvion-guard-exec"]
+    "trustedToolPolicies": ["aarvion-guard"]
   },
   "configSchema": {
     "type": "object",

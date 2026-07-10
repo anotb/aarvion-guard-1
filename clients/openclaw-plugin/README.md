@@ -10,7 +10,12 @@ and depends on nothing from the OpenClaw source — only Node built-ins.
 
 ## What happens at runtime
 
-1. An agent calls a governed tool (`exec` / `bash` / `shell`).
+1. An agent calls a governed tool. The policy sees **every** tool call — shell
+   (`exec`/`bash`), file writes (`write`/`edit`/`apply_patch`), comms/sends
+   (`message`/`sessions_send`), web egress (`web_fetch`), and any external MCP
+   server tool (`<server>__<tool>`). `OPENCLAW_GUARD_TOOLS` selects which are sent
+   to the guard: `actions` (default — everything except read-only tools like
+   `read`/`grep`/`ls`/`web_search`), `all`, or `exec`.
 2. Before dispatch, OpenClaw asks every enabled trusted tool policy to `evaluate`
    the call. This plugin's policy sends the command + caller identity (agentId,
    sessionKey) to the guard at `POST /v1/govern` over its Unix socket (bearer

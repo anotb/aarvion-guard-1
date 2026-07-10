@@ -1,28 +1,26 @@
 // Registers the Aarvion guard as an OpenClaw trusted tool policy (the PEP).
 //
-// This package is fully self-contained: it declares the minimal slice of the
-// OpenClaw plugin host API it depends on, so it builds and loads with ZERO
-// dependency on the OpenClaw source. It is installed into a stock OpenClaw with
-// `openclaw plugin install` and enabled in config - OpenClaw's own code is never
-// modified or rebuilt.
+// The policy fires before EVERY tool call OpenClaw makes - shell, file writes,
+// comms/sends, web egress, and external MCP server tools - and asks the local
+// guard PDP whether to allow it. On a deny the call is vetoed and the process /
+// action never runs. Which tools are actually sent to the guard is controlled by
+// the guard client (OPENCLAW_GUARD_TOOLS: actions|all|exec, default "actions").
+//
+// Self-contained: declares the minimal slice of the OpenClaw host API it uses, so
+// it builds and loads with ZERO dependency on the OpenClaw source.
 import { evaluateGuard } from "./guard-client.js";
 
-// --- Minimal host API surface (structural; matches OpenClaw's plugin SDK) ---
-
-/** The tool call OpenClaw is about to run. */
 export interface ToolPolicyEvent {
 	toolName?: string;
 	params?: Record<string, unknown>;
 }
 
-/** Caller context OpenClaw provides for the decision. */
 export interface ToolPolicyContext {
 	toolName: string;
 	agentId?: string;
 	sessionKey?: string;
 }
 
-/** Return `{ block: true, blockReason }` to veto; return nothing to allow. */
 export type ToolPolicyDecision =
 	| { block?: boolean; blockReason?: string; params?: Record<string, unknown> }
 	| { allow?: boolean; reason?: string }
@@ -37,29 +35,21 @@ export interface TrustedToolPolicy {
 	) => ToolPolicyDecision | Promise<ToolPolicyDecision>;
 }
 
-/** The one host method this plugin uses. */
 export interface GuardHostApi {
 	registerTrustedToolPolicy: (policy: TrustedToolPolicy) => void;
 }
 
-// Phase 1 governs the shell/exec surface. Extend as more surfaces are mapped.
-const GOVERNED_TOOLS = new Set(["exec", "bash", "shell"]);
-
 export function registerAarvionGuardPlugin(api: GuardHostApi): void {
 	api.registerTrustedToolPolicy({
-		id: "aarvion-guard-exec",
-		description: "Denies agent tool calls that the Aarvion guard PDP rejects (exec surface).",
+		id: "aarvion-guard",
+		description: "Governs agent tool calls (shell, files, comms, egress, MCP) via the Aarvion guard PDP.",
 		evaluate: async (event, ctx) => {
 			const toolName = event.toolName ?? ctx.toolName;
-			if (!GOVERNED_TOOLS.has(toolName)) return;
-
-			const rawCommand = event.params?.command;
-			const command = typeof rawCommand === "string" ? rawCommand : "";
-			if (!command) return;
+			if (!toolName) return;
 
 			const verdict = await evaluateGuard({
-				command,
 				toolName,
+				params: event.params ?? {},
 				agentId: ctx.agentId,
 				sessionKey: ctx.sessionKey,
 			});
@@ -67,7 +57,8 @@ export function registerAarvionGuardPlugin(api: GuardHostApi): void {
 				const detail = verdict.reason ?? verdict.policyId ?? "denied";
 				return { block: true, blockReason: `Aarvion guard: ${detail}` };
 			}
-			// No veto -> the guard allowed it; native allowlist/approvals still apply.
+			// No veto -> the guard allowed it (or the tool isn't governed); native
+			// allowlist/approvals still apply.
 			return;
 		},
 	});

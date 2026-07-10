@@ -1,12 +1,15 @@
 // Aarvion guard client: asks the local guard PDP (/v1/govern over a Unix socket)
-// whether an action is allowed. HTTP/1.1 over the socket; two auth factors the
-// guard enforces (bearer token + kernel-verified peer uid) plus a fresh nonce
-// per request for replay protection. Never throws; on any transport failure it
-// returns a fail-mode verdict so a guard hiccup can't crash a tool call.
+// whether a tool ACTION is allowed. Governs ANY OpenClaw tool call - shell, file
+// writes, comms/sends, web egress, and external MCP server tools - not just exec.
+// HTTP/1.1 over the socket; two auth factors (bearer token + kernel peer uid) plus
+// a fresh nonce per request. Never throws; fail-mode on any transport failure.
 import { randomBytes } from "node:crypto";
 import { request as httpRequest } from "node:http";
 
 export type GuardFailMode = "closed" | "open";
+
+/** Which tools the plugin sends to the guard. */
+export type GovernMode = "actions" | "all" | "exec";
 
 export interface GuardConfig {
 	enabled: boolean;
@@ -14,6 +17,7 @@ export interface GuardConfig {
 	token: string | null;
 	failMode: GuardFailMode;
 	timeoutMs: number;
+	governMode: GovernMode;
 }
 
 export interface GuardVerdict {
@@ -21,19 +25,116 @@ export interface GuardVerdict {
 	reason?: string;
 	policyId?: string;
 	decisionId?: string;
-	/** True when the verdict came from fail-mode (guard unreachable), not policy. */
 	failMode?: boolean;
 }
 
 export interface GuardActionInput {
-	command: string;
-	toolName?: string;
+	toolName: string;
+	params: Record<string, unknown>;
 	agentId?: string;
 	sessionKey?: string;
-	cwd?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 2_000;
+const MAX_FIELD_BYTES = 16_384; // bound any single string so we never trip the guard's 1MiB cap
+
+// Shell/command-runner tools whose payload is a literal command string.
+const SHELL_TOOLS = new Set(["exec", "bash", "shell", "sh", "command"]);
+
+// Read-only / meta tools that neither mutate, egress, nor act as the user. Exempt
+// by default (governMode "actions") to keep latency off pure reads. "all" governs
+// them too; "exec" governs only shell tools.
+const READONLY_TOOLS = new Set([
+	"read", "grep", "find", "ls", "web_search", "tool_search", "tool_describe",
+	"tool_search_code", "tool_call", "get_goal", "sessions_list", "sessions_history",
+	"session_status", "agents_list", "update_plan", "pdf", "transcripts", "heartbeat_respond",
+]);
+
+// An external MCP-server tool surfaces as "<server>__<tool>".
+function isMcpTool(toolName: string): boolean {
+	return toolName.includes("__");
+}
+
+/** Does this tool get sent to the guard under the current mode? */
+export function shouldGovern(toolName: string, mode: GovernMode): boolean {
+	if (mode === "all") return true;
+	if (mode === "exec") return SHELL_TOOLS.has(toolName);
+	// "actions": everything that could mutate/egress/act - i.e. not a known read-only
+	// tool. All MCP tools are governed (they're external, high-value).
+	return isMcpTool(toolName) || !READONLY_TOOLS.has(toolName);
+}
+
+/** Coarse surface tag so the guard's per-surface fail_mode applies correctly. */
+function surfaceFor(toolName: string): string {
+	if (SHELL_TOOLS.has(toolName)) return "exec";
+	if (isMcpTool(toolName)) return "mcp";
+	if (toolName === "web_fetch") return "egress";
+	if (toolName === "message" || toolName === "sessions_send" || toolName === "nodes") return "send";
+	return "tool";
+}
+
+function asString(v: unknown): string | undefined {
+	return typeof v === "string" ? v : undefined;
+}
+
+function truncate(s: string): string {
+	return s.length > MAX_FIELD_BYTES ? `${s.slice(0, MAX_FIELD_BYTES)}…[truncated]` : s;
+}
+
+/** Shallow copy of params with oversized string fields truncated. */
+function boundedArgs(params: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(params)) {
+		out[k] = typeof v === "string" ? truncate(v) : v;
+	}
+	return out;
+}
+
+/** The literal shell command for a shell tool, if any. */
+function shellCommand(toolName: string, params: Record<string, unknown>): string | undefined {
+	if (!SHELL_TOOLS.has(toolName)) return undefined;
+	return asString(params.command) ?? asString(params.cmd) ?? asString(params.input);
+}
+
+/**
+ * Derive the {host, path, body} the guard's OPA sees under attributes.request.http.
+ * - shell: body = the command (so command + secret-in-argv policies apply)
+ * - web egress: host/path = the target URL (so egress-host policies apply)
+ * - comms/other: body = a compact human-readable summary of the action
+ */
+function deriveHttp(toolName: string, params: Record<string, unknown>): { host: string; path: string; body: string } {
+	const cmd = shellCommand(toolName, params);
+	if (cmd !== undefined) return { host: "exec.local", path: "/", body: truncate(cmd) };
+
+	const url = asString(params.url) ?? asString(params.uri);
+	if (url) {
+		try {
+			const u = new URL(url);
+			return { host: u.host, path: u.pathname || "/", body: truncate(url) };
+		} catch {
+			/* fall through */
+		}
+	}
+
+	// comms / act-as-user and generic tools: summarize recipient + body-ish fields.
+	const parts = [params.target, params.to, params.channel, params.channelId, params.agentId, params.path]
+		.map(asString)
+		.filter(Boolean);
+	const text = [params.message, params.text, params.content, params.caption]
+		.map(asString)
+		.filter(Boolean)
+		.join(" ");
+	const summary = [parts.join("/"), text].filter(Boolean).join(" :: ") || safeJson(params);
+	return { host: `tool.${toolName}`, path: "/", body: truncate(summary) };
+}
+
+function safeJson(params: Record<string, unknown>): string {
+	try {
+		return truncate(JSON.stringify(params));
+	} catch {
+		return "";
+	}
+}
 
 function envFlag(value: string | undefined): boolean {
 	if (!value) return false;
@@ -41,15 +142,12 @@ function envFlag(value: string | undefined): boolean {
 	return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-/**
- * Resolve guard config from the environment. The socket path + token are
- * deployment secrets, so env is the right channel (the gateway's service-env).
- * Disabled unless the flag AND a socket AND a token are all present.
- */
 export function resolveGuardConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig {
 	const socketPath = env.OPENCLAW_GUARD_SOCKET?.trim() || null;
 	const token = env.OPENCLAW_GUARD_TOKEN?.trim() || null;
 	const failMode: GuardFailMode = env.OPENCLAW_GUARD_FAIL_MODE?.trim() === "open" ? "open" : "closed";
+	const modeRaw = env.OPENCLAW_GUARD_TOOLS?.trim().toLowerCase();
+	const governMode: GovernMode = modeRaw === "all" ? "all" : modeRaw === "exec" ? "exec" : "actions";
 	const parsedTimeout = Number.parseInt(env.OPENCLAW_GUARD_TIMEOUT_MS?.trim() ?? "", 10);
 	const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : DEFAULT_TIMEOUT_MS;
 	return {
@@ -58,36 +156,36 @@ export function resolveGuardConfig(env: NodeJS.ProcessEnv = process.env): GuardC
 		token,
 		failMode,
 		timeoutMs,
+		governMode,
 	};
 }
 
 function buildGovernBody(input: GuardActionInput): string {
 	const nonce = randomBytes(16).toString("hex");
+	const { toolName, params } = input;
+	const http = deriveHttp(toolName, params);
+	const cmd = shellCommand(toolName, params);
 	return JSON.stringify({
 		contract_version: "1",
 		nonce,
 		ctx: {
-			surface: "exec",
+			surface: surfaceFor(toolName),
 			phase: "pre",
 			caller: {
 				principal_id: input.agentId,
 				session_id: input.sessionKey,
 				source: "openclaw",
-				tool: input.toolName ?? "bash",
+				tool: toolName,
 				trust: "untrusted",
 			},
 		},
 		action: {
-			tool: input.toolName ?? "bash",
-			operation: "exec",
-			args: { cmd: input.command, cwd: input.cwd },
+			tool: toolName,
+			operation: cmd !== undefined ? "exec" : "call",
+			args: { ...boundedArgs(params), ...(cmd !== undefined ? { cmd } : {}) },
 		},
-		// The command doubles as the http "body" so body-scanning packs (e.g. secret
-		// exfil) also catch secrets that leak into an argv.
 		attributes: {
-			request: {
-				http: { method: "POST", host: "exec.local", path: "/", body: input.command, headers: {} },
-			},
+			request: { http: { method: "POST", host: http.host, path: http.path, body: http.body, headers: {} } },
 		},
 	});
 }
@@ -107,20 +205,9 @@ function parseVerdict(raw: string): GuardVerdict | null {
 		return null;
 	}
 	if (parsed.verdict !== "allow" && parsed.verdict !== "deny") return null;
-	return {
-		verdict: parsed.verdict,
-		reason: parsed.reason,
-		policyId: parsed.policy_id,
-		decisionId: parsed.decision_id,
-	};
+	return { verdict: parsed.verdict, reason: parsed.reason, policyId: parsed.policy_id, decisionId: parsed.decision_id };
 }
 
-/**
- * POST the action to the guard and return its verdict. The guard answers 200 for
- * allow and 403 for deny, BOTH carrying a JSON verdict body, so we parse the body
- * regardless of status and only fall back to null (transport failure) when there
- * is no parseable verdict (e.g. 401 auth failure, timeout, socket down).
- */
 export function requestGuardVerdict(input: GuardActionInput, config: GuardConfig): Promise<GuardVerdict | null> {
 	if (!config.socketPath || !config.token) return Promise.resolve(null);
 	const body = buildGovernBody(input);
@@ -159,16 +246,17 @@ export function requestGuardVerdict(input: GuardActionInput, config: GuardConfig
 }
 
 /**
- * High-level entry the plugin policy calls. Always resolves to a concrete
- * verdict: a no-op allow when disabled, the guard's policy verdict when
- * reachable, or the configured fail-mode when it isn't (default fail-closed ->
- * deny, since a governance layer that fails open is theater).
+ * The high-level entry the plugin policy calls for every tool. Returns a concrete
+ * verdict: a no-op allow when disabled or when the tool isn't governed under the
+ * current mode, the guard's policy verdict when reachable, or the configured
+ * fail-mode when it isn't (default fail-closed -> deny). Never throws.
  */
 export async function evaluateGuard(
 	input: GuardActionInput,
 	config: GuardConfig = resolveGuardConfig(),
 ): Promise<GuardVerdict> {
 	if (!config.enabled) return { verdict: "allow" };
+	if (!shouldGovern(input.toolName, config.governMode)) return { verdict: "allow" };
 	const verdict = await requestGuardVerdict(input, config);
 	if (verdict) return verdict;
 	if (config.failMode === "open") {

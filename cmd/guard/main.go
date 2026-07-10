@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aarvion-ai/aarvion-guard/internal/approve"
 	"github.com/aarvion-ai/aarvion-guard/internal/ca"
 	"github.com/aarvion-ai/aarvion-guard/internal/config"
 	"github.com/aarvion-ai/aarvion-guard/internal/console"
@@ -503,10 +504,8 @@ func loadOverlay() *overlay.Store {
 
 // applyPacks compiles the operator's policy packs (~/.aarvion/packs.json) into
 // tighten-only overlay rules and merges them into the shared overlay store BEFORE
-// the govern server starts, so pack guardrails enforce from boot. Hand-authored
-// overlay rules are preserved; only prior "pack:"-prefixed rules are replaced, so
-// re-running is idempotent (no duplicate-id validation failure across restarts).
-// A missing packs.json is a no-op (the overlay is left exactly as loaded). Any
+// the govern server starts, so pack guardrails enforce from boot. A missing
+// packs.json is a no-op (the overlay is left exactly as loaded). Any
 // load/compile/replace error is logged and non-fatal — a bad pack file must not
 // stop the guard.
 func applyPacks(ov *overlay.Store) {
@@ -521,7 +520,22 @@ func applyPacks(ov *overlay.Store) {
 		fmt.Fprintf(os.Stderr, "[packs] disabled: %v\n", err)
 		return
 	}
-	compiled := packs.CompileOverlay(ps.Set())
+	if err := mergePacks(ov, ps.Set()); err != nil {
+		fmt.Fprintf(os.Stderr, "[packs] not applied: %v\n", err)
+	}
+}
+
+// mergePacks compiles a pack Set into tighten-only overlay rules and merges them
+// into the shared overlay store, preserving hand-authored rules: only prior
+// "pack:"-prefixed rules are replaced, so re-applying is idempotent (no
+// duplicate-id validation failure). It is the single merge path shared by
+// boot-time applyPacks and the console's OnPacksChanged callback, so a live pack
+// edit recompiles exactly as boot does. A nil store is a no-op.
+func mergePacks(ov *overlay.Store, set packs.Set) error {
+	if ov == nil {
+		return nil
+	}
+	compiled := packs.CompileOverlay(set)
 	var merged []overlay.Rule
 	for _, r := range ov.Rules() {
 		if !strings.HasPrefix(r.ID, "pack:") {
@@ -530,10 +544,10 @@ func applyPacks(ov *overlay.Store) {
 	}
 	merged = append(merged, compiled...)
 	if err := ov.Replace(merged); err != nil {
-		fmt.Fprintf(os.Stderr, "[packs] not applied: %v\n", err)
-		return
+		return err
 	}
 	fmt.Printf("applied %d pack rules to the local overlay\n", len(compiled))
+	return nil
 }
 
 // reloadOverlay re-reads overlay.json on a ticker so out-of-band edits (a hand
@@ -554,12 +568,25 @@ func reloadOverlay(ctx context.Context, ov *overlay.Store) {
 	}
 }
 
+// consoleDeps are the optional, opt-in surfaces cmdRun wires into the console:
+// the operator's pack store (Packs board + promote target), the approvals inbox
+// (Manager, nil when the approver is off), the learn-mode behaviour profile, and
+// the recompile-on-pack-change callback. Each is nil-safe: a nil field degrades
+// the corresponding console panel gracefully.
+type consoleDeps struct {
+	packs          *packs.Store
+	approvals      console.ApprovalsAPI
+	behaviour      console.BehaviourAPI
+	onPacksChanged func(packs.Set) error
+}
+
 // startConsole serves the loopback governance console (live feed + tighten-only
-// overlay editor) when enabled. It mints a fresh bearer token per run, writes it
-// 0600 so `dashboard` can open the browser pre-authed, and wires the shared
-// overlay store plus a control-plane sync adapter. Loopback bind + token gate
-// means only the same local user can reach it. No-op when console is disabled.
-func startConsole(ctx context.Context, cfg *config.Config, ov *overlay.Store) {
+// overlay editor + Packs/Learning/Approvals) when enabled. It mints a fresh
+// bearer token per run, writes it 0600 so `dashboard` can open the browser
+// pre-authed, and wires the shared overlay store, a control-plane sync adapter,
+// and the opt-in consoleDeps. Loopback bind + token gate means only the same
+// local user can reach it. No-op when console is disabled.
+func startConsole(ctx context.Context, cfg *config.Config, ov *overlay.Store, deps consoleDeps) {
 	if !cfg.Console.Enabled {
 		return
 	}
@@ -577,13 +604,17 @@ func startConsole(ctx context.Context, cfg *config.Config, ov *overlay.Store) {
 		cp = consoleCP{cpsync.New(cfg.CPUrl, cfg.Tenant, cfg.EntityID, cfg.EnrollmentToken)}
 	}
 	srv := console.New(console.Config{
-		Addr:     addr,
-		Token:    token,
-		FeedPath: cfg.Observability.AuditJSONLPath,
-		Entity:   cfg.EntityID,
-		Tenant:   cfg.Tenant,
-		Overlay:  ov,
-		CP:       cp,
+		Addr:           addr,
+		Token:          token,
+		FeedPath:       cfg.Observability.AuditJSONLPath,
+		Entity:         cfg.EntityID,
+		Tenant:         cfg.Tenant,
+		Overlay:        ov,
+		CP:             cp,
+		Packs:          deps.packs,
+		Approvals:      deps.approvals,
+		Behaviour:      deps.behaviour,
+		OnPacksChanged: deps.onPacksChanged,
 	})
 	go func() {
 		if err := srv.ListenAndServe(ctx); err != nil {
@@ -605,6 +636,67 @@ func (a consoleCP) Status(ctx context.Context) (console.SyncStatus, error) {
 
 func (a consoleCP) PushOverlay(ctx context.Context, rules []overlay.Rule) error {
 	return a.c.PushOverlay(ctx, rules)
+}
+
+// behaviourAPI adapts a *sinks.Behaviour to the console.BehaviourAPI interface
+// while guarding the typed-nil trap: a nil *Behaviour must stay a nil interface
+// (not a non-nil interface wrapping a nil pointer, which would panic when the
+// console calls Profile). Returns nil for a nil observer so the Learning panel
+// degrades to an empty profile.
+func behaviourAPI(b *sinks.Behaviour) console.BehaviourAPI {
+	if b == nil {
+		return nil
+	}
+	return b
+}
+
+// buildApprover constructs the human-in-the-loop approver from config, or nil
+// when approve is disabled (the default), in which case an `ask` verdict behaves
+// exactly as today. When enabled it builds a pending Store (mirrored under
+// ~/.aarvion/pending for crash visibility) and, when Telegram creds are present,
+// a Telegram notifier whose long-poll loop resolves button taps back into the
+// store. A Reap ticker denies expired pendings (fail-safe). The returned Manager
+// satisfies both govern.Approver (PDP) and the console approvals inbox.
+func buildApprover(ctx context.Context, cfg *config.Config) *approve.Manager {
+	if !cfg.Approve.Enabled {
+		return nil
+	}
+
+	store := approve.NewStoreWithMirror(config.PendingDir())
+
+	var tg *approve.Telegram
+	tgCfg := cfg.Approve.Telegram
+	if tgCfg.BotToken != "" && tgCfg.ChatID != "" {
+		tg = approve.NewTelegram(tgCfg.BotToken, tgCfg.ChatID, "")
+		// Long-poll for owner taps; each tap resolves the matching pending. Runs for
+		// the process lifetime, backing off on transport errors.
+		go tg.Poll(ctx, store.Resolve)
+		fmt.Println("approvals: Telegram notifications active")
+	} else {
+		fmt.Println("approvals: console inbox only (no Telegram creds configured)")
+	}
+
+	// A pending that no human answers must fail safe to deny; the reaper enforces
+	// the TTL on a ticker. Poll faster than the TTL so expiry is timely.
+	ttl := time.Duration(cfg.Approve.TimeoutSeconds) * time.Second
+	go reapApprovals(ctx, store)
+
+	return approve.NewManager(store, tg, ttl)
+}
+
+// reapApprovals runs the approver's TTL reaper on a ticker until ctx is
+// cancelled: any pending past its Created+TTL is resolved to deny (fail-safe).
+func reapApprovals(ctx context.Context, store *approve.Store) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			store.Reap(now)
+		}
+	}
 }
 
 // cmdDashboard opens the local governance console in the default browser using
@@ -661,6 +753,15 @@ func cmdRun() {
 	// in-process immediately. loadOverlay tolerates a missing file (empty store); a
 	// background reloader also picks up out-of-band edits to overlay.json.
 	ov := loadOverlay()
+	// The operator's policy-pack store, shared by the boot-time compile and the
+	// console's Packs board + learn-mode promote, so a live edit and a boot compile
+	// go through the SAME store and merge path. A load error (malformed JSON) leaves
+	// packsStore nil; the console then falls back to the built-in catalog.
+	packsStore, err := packs.Load(config.PacksPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[packs] disabled: %v\n", err)
+		packsStore = nil
+	}
 	// Compile the operator's policy packs into the overlay BEFORE the govern server
 	// starts, so pack guardrails enforce from boot. No-op when packs.json is absent.
 	applyPacks(ov)
@@ -702,9 +803,35 @@ func cmdRun() {
 	closeSinks := attachSinks(ctx, cfg, rec)
 	defer closeSinks()
 
-	// Loopback governance console: live decision feed + tighten-only overlay editor
-	// that syncs up to the control plane. Started once, independent of proxy mode.
-	startConsole(ctx, cfg, ov)
+	// Always-on learn-mode behaviour observer: it records what each agent actually
+	// does per {principal,surface,verb} so observe-mode packs and the propose step
+	// have real usage to reason about. Low overhead (in-memory tally, disk write off
+	// the hot path). Built before the console + PDP so both can share it.
+	behaviour := sinks.NewBehaviour(config.BehaviourProfilePath(), 0)
+	if behaviour != nil {
+		go behaviour.Run(ctx)
+		defer func() { _ = behaviour.Close() }()
+	}
+
+	// Optional human-in-the-loop approver behind an `ask` verdict: a pending store,
+	// an optional Telegram notifier, and the Manager that bridges both the PDP
+	// (govern.Approver) and the console inbox (Approvals). nil when approve is
+	// disabled, which keeps today's behaviour (ask returns to the PEP, no pending).
+	approver := buildApprover(ctx, cfg)
+
+	// Loopback governance console: live decision feed + tighten-only overlay editor,
+	// the Packs board, the Learning panel, and the Approvals inbox. Started once,
+	// independent of proxy mode. Wiring the approver + behaviour + packs store lights
+	// up those panels; a live pack edit recompiles via mergePacks (same as boot).
+	deps := consoleDeps{
+		packs:          packsStore,
+		behaviour:      behaviourAPI(behaviour),
+		onPacksChanged: func(set packs.Set) error { return mergePacks(ov, set) },
+	}
+	if approver != nil {
+		deps.approvals = approver
+	}
+	startConsole(ctx, cfg, ov, deps)
 
 	// Optional egress rate limiter: an in-memory, per-host ceiling checked before
 	// OPA. nil when rate_limit is disabled, which preserves the prior behavior.
@@ -741,16 +868,6 @@ func cmdRun() {
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
-	// Always-on learn-mode behaviour observer: it records what each agent actually
-	// does per {principal,surface,verb} so observe-mode packs and the propose step
-	// have real usage to reason about. Low overhead (in-memory tally, disk write off
-	// the hot path). nil-safe: a construction failure just leaves Observer unset.
-	behaviour := sinks.NewBehaviour(config.BehaviourProfilePath(), 0)
-	if behaviour != nil {
-		go behaviour.Run(ctx)
-		defer func() { _ = behaviour.Close() }()
-	}
-
 	// The runtime PDP is optional: only start it when a socket is configured.
 	// It shares the policy client + recorder with the proxy, so both governance
 	// paths write to the same OPA and decision chain.
@@ -769,6 +886,12 @@ func cmdRun() {
 		// keeps it correct if that ever changes.
 		if behaviour != nil {
 			gcfg.Observer = behaviour
+		}
+		// Wire the approver so an `ask` verdict opens a pending (notified over
+		// Telegram, resolvable in the console). nil-guarded to avoid a typed-nil
+		// interface: a nil *approve.Manager must not become a non-nil Approver.
+		if approver != nil {
+			gcfg.Approver = approver
 		}
 		gsrv := govern.New(gcfg, pol, rec)
 		go func() {

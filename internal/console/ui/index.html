@@ -47,7 +47,19 @@
   </span>
 </div>
 
+<nav class="tabs" role="tablist" aria-label="Console views">
+  <button class="tab is-active" role="tab" data-view="decisions" aria-selected="true">Decisions</button>
+  <button class="tab" role="tab" data-view="packs" aria-selected="false">Packs</button>
+  <button class="tab" role="tab" data-view="learning" aria-selected="false">Learning</button>
+  <button class="tab" role="tab" data-view="approvals" aria-selected="false">
+    Approvals <span class="tab-badge" id="approvalsBadge" hidden>0</span>
+  </button>
+</nav>
+
 <main class="wrap">
+
+  <!-- ============ VIEW: DECISIONS ============ -->
+  <div class="view is-active" id="view-decisions" role="tabpanel">
 
   <!-- 1) LIVE DECISIONS FEED ------------------------------------------------ -->
   <section class="panel" id="feed" aria-labelledby="feed-h">
@@ -120,6 +132,105 @@
     <div id="ruleList" class="rule-list" role="list"><!-- rule cards injected --></div>
   </section>
 
+  </div><!-- /view-decisions -->
+
+  <!-- ============ VIEW: PACKS ============ -->
+  <div class="view" id="view-packs" role="tabpanel" hidden>
+    <section class="panel" aria-labelledby="packs-h">
+      <div class="panel-head">
+        <div class="panel-title">
+          <h2 id="packs-h">Policy packs</h2>
+          <span class="panel-note">consumer guardrails — toggle a mode per surface, no rule-writing</span>
+        </div>
+        <div class="panel-tools">
+          <button id="savePacks" class="btn btn-accent" type="button">Save packs</button>
+        </div>
+      </div>
+
+      <p class="overlay-guardrail">
+        Packs compile to <strong>tighten-only</strong> overlay rules on this machine.
+        <em>observe</em> records what would happen · <em>ask</em> asks you first · <em>enforce</em> blocks.
+      </p>
+
+      <div id="packsError" class="state state-error" hidden></div>
+      <div id="packsSaved" class="state state-ok" hidden>Packs saved and applied.</div>
+      <div class="state state-loading" id="packsLoading">
+        <span class="spinner" aria-hidden="true"></span> Loading packs…
+      </div>
+
+      <div id="packList" class="pack-list"><!-- pack cards injected --></div>
+    </section>
+  </div>
+
+  <!-- ============ VIEW: LEARNING ============ -->
+  <div class="view" id="view-learning" role="tabpanel" hidden>
+    <section class="panel" aria-labelledby="learn-h">
+      <div class="panel-head">
+        <div class="panel-title">
+          <h2 id="learn-h">Learn mode</h2>
+          <span class="panel-note">what your agents actually do — and the packs we'd propose</span>
+        </div>
+        <div class="panel-tools">
+          <button id="protectNow" class="btn btn-accent" type="button" title="Promote the proposal to live packs">
+            Protect me now
+          </button>
+        </div>
+      </div>
+
+      <div id="learnError" class="state state-error" hidden></div>
+      <div id="learnSaved" class="state state-ok" hidden>Proposal promoted — packs applied.</div>
+      <div class="state state-loading" id="learnLoading">
+        <span class="spinner" aria-hidden="true"></span> Loading behaviour…
+      </div>
+      <div class="state state-empty" id="learnEmpty" hidden>
+        No behaviour observed yet. As agents act, their per-surface habits appear here.
+      </div>
+
+      <div class="table-scroll">
+        <table class="feed-table learn-table">
+          <thead>
+            <tr>
+              <th>agent</th>
+              <th>surface</th>
+              <th>verb</th>
+              <th class="col-num">count</th>
+              <th class="col-num">would-block</th>
+              <th>last seen</th>
+            </tr>
+          </thead>
+          <tbody id="learnBody"><!-- rows injected --></tbody>
+        </table>
+      </div>
+
+      <div class="propose" id="proposeBox" hidden>
+        <div class="propose-head">Proposed packs</div>
+        <div id="proposeList" class="propose-list"><!-- chips injected --></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ============ VIEW: APPROVALS ============ -->
+  <div class="view" id="view-approvals" role="tabpanel" hidden>
+    <section class="panel" aria-labelledby="appr-h">
+      <div class="panel-head">
+        <div class="panel-title">
+          <h2 id="appr-h">Approvals inbox</h2>
+          <span class="panel-note">actions waiting on you — refreshing every 3s</span>
+        </div>
+        <div class="panel-tools">
+          <span class="live" id="apprLive"><span class="live-dot" aria-hidden="true"></span> live</span>
+        </div>
+      </div>
+
+      <div id="approvalsError" class="state state-error" hidden></div>
+      <div class="state state-empty" id="approvalsEmpty" hidden>
+        Nothing pending. Actions that need your say-so land here (and ping your Telegram).
+      </div>
+
+      <div id="approvalList" class="approval-list"><!-- pending cards injected --></div>
+    </section>
+  </div>
+
 </main>
 
 <footer class="foot">
@@ -184,6 +295,52 @@
       </div>
 
       <p class="rule-err" data-role="err" hidden></p>
+    </div>
+  </div>
+</template>
+
+<!-- Hidden template for one pack card, cloned per pack in app.js. -->
+<template id="packTpl">
+  <div class="pack" role="group">
+    <div class="pack-bar" data-role="bar" aria-hidden="true"></div>
+    <div class="pack-body">
+      <div class="pack-head">
+        <div class="pack-id">
+          <span class="pack-title" data-field="title">—</span>
+          <code class="pack-key" data-field="id">—</code>
+        </div>
+        <label class="field field-mode">
+          <span class="field-label">mode</span>
+          <select data-field="mode">
+            <option value="off">off</option>
+            <option value="observe">observe</option>
+            <option value="ask">ask</option>
+            <option value="enforce">enforce</option>
+          </select>
+        </label>
+      </div>
+      <div class="pack-agents" data-role="agents" hidden>
+        <span class="field-label">per-agent</span>
+        <div class="chips" data-role="chips"><!-- per-agent chips injected --></div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- Hidden template for one pending approval card. -->
+<template id="approvalTpl">
+  <div class="approval" role="group">
+    <div class="approval-main">
+      <div class="approval-line">
+        <span class="approval-agent" data-field="principal">—</span>
+        <span class="approval-arrow" aria-hidden="true">→</span>
+        <span class="chip chip-ask approval-verb"><span data-field="surface">—</span>&nbsp;<span data-field="verb">—</span></span>
+      </div>
+      <div class="approval-reason" data-field="reason">—</div>
+    </div>
+    <div class="approval-acts">
+      <button type="button" class="btn approval-deny" data-action="deny">Deny</button>
+      <button type="button" class="btn btn-accent approval-allow" data-action="allow">Approve</button>
     </div>
   </div>
 </template>

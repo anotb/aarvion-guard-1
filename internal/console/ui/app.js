@@ -487,9 +487,358 @@ function cssEscape(v) {
 }
 
 // ===========================================================================
+// 4) TAB NAVIGATION
+// ===========================================================================
+
+// Lazy loaders run once when a view is first shown; pollers keep running.
+const viewLoaded = { decisions: true, packs: false, learning: false, approvals: false };
+
+function showView(name) {
+  for (const tab of document.querySelectorAll(".tab")) {
+    const on = tab.dataset.view === name;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-selected", on ? "true" : "false");
+  }
+  for (const view of document.querySelectorAll(".view")) {
+    const on = view.id === "view-" + name;
+    view.classList.toggle("is-active", on);
+    view.hidden = !on;
+  }
+  if (!viewLoaded[name]) {
+    viewLoaded[name] = true;
+    if (name === "packs") loadPacks();
+    if (name === "learning") loadLearn();
+  }
+}
+
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => showView(tab.dataset.view));
+}
+
+// ===========================================================================
+// 5) PACKS BOARD
+// ===========================================================================
+
+const packTpl = el("packTpl");
+const MODES = ["off", "observe", "ask", "enforce"];
+
+function packModeClass(mode) {
+  return "m-" + (MODES.includes(mode) ? mode : "observe");
+}
+
+function makePackCard(pack) {
+  const node = packTpl.content.firstElementChild.cloneNode(true);
+  node.dataset.id = pack.id;
+
+  node.querySelector('[data-field="title"]').textContent = pack.title || pack.id;
+  node.querySelector('[data-field="id"]').textContent = pack.id;
+
+  const sel = node.querySelector('[data-field="mode"]');
+  sel.value = MODES.includes(pack.mode) ? pack.mode : "observe";
+  applyPackMode(node, sel.value);
+  sel.addEventListener("change", () => applyPackMode(node, sel.value));
+
+  // stash params so a round-trip Save preserves allowlists/quiet-hours untouched.
+  node._params = pack.params || null;
+
+  renderAgentChips(node, pack.per_agent || {});
+  return node;
+}
+
+function applyPackMode(node, mode) {
+  node.classList.remove("m-off", "m-observe", "m-ask", "m-enforce");
+  node.classList.add(packModeClass(mode));
+}
+
+function renderAgentChips(node, perAgent) {
+  const wrap = node.querySelector('[data-role="agents"]');
+  const chips = node.querySelector('[data-role="chips"]');
+  chips.replaceChildren();
+  const names = Object.keys(perAgent).sort();
+  if (names.length === 0) {
+    wrap.hidden = true;
+    node._perAgent = {};
+    return;
+  }
+  wrap.hidden = false;
+  node._perAgent = Object.assign({}, perAgent);
+  for (const name of names) {
+    const chip = document.createElement("span");
+    chip.className = "chip-agent " + packModeClass(perAgent[name]);
+    const who = document.createElement("span");
+    who.textContent = name;
+    const m = document.createElement("span");
+    m.className = "chip-agent-mode";
+    m.textContent = perAgent[name];
+    chip.append(who, m);
+    chips.appendChild(chip);
+  }
+}
+
+function renderPacks(packs) {
+  const list = el("packList");
+  list.replaceChildren();
+  for (const p of packs || []) list.appendChild(makePackCard(p));
+}
+
+async function loadPacks() {
+  const loading = el("packsLoading");
+  const error = el("packsError");
+  try {
+    const data = await api("/api/packs");
+    const packs = (data && data.packs) || [];
+    loading.hidden = true;
+    renderPacks(packs);
+  } catch (err) {
+    loading.hidden = true;
+    error.hidden = false;
+    error.textContent = authOr(err, "Could not load packs: " + err.message);
+  }
+}
+
+function collectPacks() {
+  const cards = el("packList").querySelectorAll(".pack");
+  const packs = [];
+  for (const node of cards) {
+    const p = {
+      id: node.dataset.id,
+      title: node.querySelector('[data-field="title"]').textContent,
+      mode: node.querySelector('[data-field="mode"]').value,
+    };
+    if (node._params) p.params = node._params;
+    if (node._perAgent && Object.keys(node._perAgent).length) p.per_agent = node._perAgent;
+    packs.push(p);
+  }
+  return packs;
+}
+
+el("savePacks").addEventListener("click", async () => {
+  const btn = el("savePacks");
+  el("packsError").hidden = true;
+  el("packsSaved").hidden = true;
+  btn.disabled = true;
+  btn.textContent = "Saving…";
+  try {
+    await api("/api/packs", {
+      method: "PUT",
+      body: JSON.stringify({ packs: collectPacks() }),
+    });
+    el("packsSaved").hidden = false;
+    await loadPacks();
+    setTimeout(() => (el("packsSaved").hidden = true), 3000);
+  } catch (err) {
+    const e = el("packsError");
+    e.hidden = false;
+    e.textContent = authOr(err, "Packs rejected: " + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save packs";
+  }
+});
+
+// ===========================================================================
+// 6) LEARNING PANEL
+// ===========================================================================
+
+function renderProfile(profile) {
+  const body = el("learnBody");
+  const empty = el("learnEmpty");
+  body.replaceChildren();
+  const entries = (profile && profile.entries) || [];
+  if (entries.length === 0) {
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  const frag = document.createDocumentFragment();
+  for (const e of entries) {
+    const tr = document.createElement("tr");
+    const cells = [
+      [e.principal || "—", "cell-caller"],
+      [e.surface || "—", "cell-surface"],
+      [e.verb || "—", "cell-surface"],
+      [String(e.count || 0), "cell-num"],
+      [String(e.would_block || 0), "cell-num cell-block" + (e.would_block ? " is-hot" : "")],
+      [relTime(e.last_seen), "cell-time"],
+    ];
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td");
+      td.className = cls;
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  body.replaceChildren(frag);
+}
+
+function renderProposal(proposal) {
+  const box = el("proposeBox");
+  const list = el("proposeList");
+  list.replaceChildren();
+  const packs = (proposal && proposal.packs) || [];
+  const active = packs.filter((p) => p.mode && p.mode !== "off");
+  if (active.length === 0) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  for (const p of active) {
+    const chip = document.createElement("span");
+    chip.className = "propose-chip " + packModeClass(p.mode);
+    const id = document.createElement("span");
+    id.textContent = p.id;
+    const mode = document.createElement("span");
+    mode.className = "pc-mode";
+    mode.textContent = p.mode;
+    chip.append(id, mode);
+    const agents = p.per_agent ? Object.keys(p.per_agent) : [];
+    if (agents.length) {
+      const a = document.createElement("span");
+      a.className = "pc-agent";
+      a.textContent = agents.join(", ");
+      chip.appendChild(a);
+    }
+    list.appendChild(chip);
+  }
+}
+
+async function loadLearn() {
+  const loading = el("learnLoading");
+  const error = el("learnError");
+  try {
+    const data = await api("/api/learn");
+    loading.hidden = true;
+    renderProfile(data && data.profile);
+    renderProposal(data && data.proposal);
+  } catch (err) {
+    loading.hidden = true;
+    error.hidden = false;
+    error.textContent = authOr(err, "Could not load behaviour: " + err.message);
+  }
+}
+
+el("protectNow").addEventListener("click", async () => {
+  const btn = el("protectNow");
+  el("learnError").hidden = true;
+  el("learnSaved").hidden = true;
+  btn.disabled = true;
+  btn.textContent = "Promoting…";
+  try {
+    await api("/api/learn/promote", { method: "POST" });
+    el("learnSaved").hidden = false;
+    // Reflect the promotion on the packs board next time it's opened.
+    viewLoaded.packs = false;
+    setTimeout(() => (el("learnSaved").hidden = true), 3000);
+  } catch (err) {
+    const e = el("learnError");
+    e.hidden = false;
+    e.textContent = authOr(err, "Could not promote: " + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Protect me now";
+  }
+});
+
+// ===========================================================================
+// 7) APPROVALS INBOX
+// ===========================================================================
+
+const approvalTpl = el("approvalTpl");
+
+function makeApprovalCard(p) {
+  const node = approvalTpl.content.firstElementChild.cloneNode(true);
+  node.dataset.id = p.decision_id;
+  node.querySelector('[data-field="principal"]').textContent = p.principal || "agent";
+  node.querySelector('[data-field="surface"]').textContent = p.surface || "?";
+  node.querySelector('[data-field="verb"]').textContent = p.verb || "?";
+  node.querySelector('[data-field="reason"]').textContent = p.reason || "awaiting your decision";
+
+  for (const btn of node.querySelectorAll("[data-action]")) {
+    btn.addEventListener("click", () => resolveApproval(node, btn.dataset.action));
+  }
+  return node;
+}
+
+async function resolveApproval(node, verdict) {
+  const id = node.dataset.id;
+  node.classList.add("is-resolving");
+  try {
+    await api("/api/approvals/" + encodeURIComponent(id), {
+      method: "POST",
+      body: JSON.stringify({ verdict }),
+    });
+    node.remove();
+    refreshApprovalsEmpty();
+    loadApprovals(); // resync count/badge
+  } catch (err) {
+    node.classList.remove("is-resolving");
+    const e = el("approvalsError");
+    e.hidden = false;
+    e.textContent = authOr(err, "Could not resolve: " + err.message);
+  }
+}
+
+function refreshApprovalsEmpty() {
+  const has = el("approvalList").querySelector(".approval");
+  el("approvalsEmpty").hidden = !!has;
+}
+
+function setApprovalsBadge(n) {
+  const badge = el("approvalsBadge");
+  badge.textContent = String(n);
+  badge.hidden = n === 0;
+}
+
+function renderApprovals(pending) {
+  const list = el("approvalList");
+  list.replaceChildren();
+  for (const p of pending || []) list.appendChild(makeApprovalCard(p));
+  refreshApprovalsEmpty();
+  setApprovalsBadge((pending || []).length);
+}
+
+async function loadApprovals() {
+  try {
+    const data = await api("/api/approvals");
+    const pending = (data && data.pending) || [];
+    el("approvalsError").hidden = true;
+    // Don't clobber a card the user is mid-resolving; only re-render when the
+    // set of ids actually changed.
+    if (approvalsChanged(pending)) renderApprovals(pending);
+    el("apprLive").classList.remove("is-idle");
+  } catch (err) {
+    el("apprLive").classList.add("is-idle");
+    if (err.status === 401) {
+      const e = el("approvalsError");
+      e.hidden = false;
+      e.textContent = "Not authorized. Reopen from `aarvion-guard dashboard`.";
+    }
+  }
+}
+
+let lastApprovalIds = "";
+function approvalsChanged(pending) {
+  const ids = (pending || []).map((p) => p.decision_id).sort().join(",");
+  if (ids === lastApprovalIds) return false;
+  lastApprovalIds = ids;
+  return true;
+}
+
+// authOr: unify the 401 message across panels.
+function authOr(err, fallback) {
+  return err.status === 401
+    ? "Not authorized. Reopen the console from `aarvion-guard dashboard`."
+    : fallback;
+}
+
+// ===========================================================================
 // boot
 // ===========================================================================
 loadStatus();
 setInterval(loadStatus, 15000); // keep the pill fresh
 startFeed();
 loadOverlay();
+// Approvals poll runs regardless of the active tab so the badge stays live.
+loadApprovals();
+setInterval(loadApprovals, 3000);

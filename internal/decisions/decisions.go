@@ -189,7 +189,11 @@ func (r *Recorder) Add(method, host, path, decision, policyID, reason, redaction
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if decision == "allow" && r.collapse(method, host, path) {
+	// Collapse only *unmarked* allows (a plain OPA/essential allow). A marked allow
+	// carries an audit-critical reason - a break_glass bypass or an observe-mode
+	// novel_host_observed flag - and must be recorded every time, never deduped, so
+	// the bypass window / observation is fully visible in the forensic chain.
+	if decision == "allow" && reason == "" && r.collapse(method, host, path) {
 		r.total++
 		return
 	}

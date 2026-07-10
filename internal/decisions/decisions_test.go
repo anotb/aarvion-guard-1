@@ -302,6 +302,45 @@ func TestSinkCalledOnBothPaths(t *testing.T) {
 	}
 }
 
+// A plain (unmarked) allow collapses on repeat within the flush window, but a
+// marked allow - a break_glass bypass or an observe-mode novel_host_observed
+// flag - is queued every time so the bypass window / observation is never
+// deduped out of the forensic chain.
+func TestMarkedAllowsNeverCollapse(t *testing.T) {
+	r := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "c.json"))
+
+	// Two identical plain allows → the second collapses; one row queued.
+	r.Add("GET", "api.example.com", "/x", "allow", "", "", "", true, 1)
+	r.Add("GET", "api.example.com", "/x", "allow", "", "", "", true, 1)
+	if len(r.pending) != 1 {
+		t.Fatalf("plain allow should collapse on repeat: got %d rows want 1", len(r.pending))
+	}
+
+	countReason := func(reason string) int {
+		n := 0
+		for _, rec := range r.pending {
+			if rec.Reason == reason {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Two identical break_glass allows → both queued (never collapsed).
+	r.Add("GET", "svc.example.com", "/y", "allow", "guard", "break_glass", "", false, 1)
+	r.Add("GET", "svc.example.com", "/y", "allow", "guard", "break_glass", "", false, 1)
+	if got := countReason("break_glass"); got != 2 {
+		t.Fatalf("break_glass allows must never collapse: got %d rows want 2", got)
+	}
+
+	// Same for the observe-mode marker.
+	r.Add("GET", "novel.example.com", "/z", "allow", "", "novel_host_observed", "", true, 1)
+	r.Add("GET", "novel.example.com", "/z", "allow", "", "novel_host_observed", "", true, 1)
+	if got := countReason("novel_host_observed"); got != 2 {
+		t.Fatalf("novel_host_observed allows must never collapse: got %d rows want 2", got)
+	}
+}
+
 // A nil sink (the default: no observability configured) must be safe - the
 // decision path just skips the hook.
 func TestNilSinkIsSafe(t *testing.T) {

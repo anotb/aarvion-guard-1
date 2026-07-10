@@ -58,6 +58,13 @@ type Record struct {
 	Verb     string   `json:"verb,omitempty"`
 	Findings []string `json:"findings,omitempty"`
 
+	// WouldBe is the verdict an observe-mode overlay rule WOULD have imposed
+	// (deny/ask) on a row whose effective Decision stayed allow (Enforced=false).
+	// It is learn-mode row metadata only - NOT hashed, same as the fields above -
+	// so an observe row's row_hash matches the equivalent enforced row. Do not add
+	// it to hashFields without reconciling the DP shipper + CP verify.
+	WouldBe string `json:"would_be,omitempty"`
+
 	PrevHash string `json:"prev_hash"`
 	RowHash  string `json:"row_hash"`
 }

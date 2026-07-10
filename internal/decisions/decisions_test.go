@@ -269,6 +269,42 @@ func TestSemanticFieldsDoNotChangeRowHash(t *testing.T) {
 	}
 }
 
+// WouldBe is learn-mode row metadata: when an observe-mode overlay rule matches,
+// the row records the would-be verdict (deny/ask) while the effective decision
+// stays allow. Like Verb/Findings it is NOT hashed, so two rows with identical
+// core fields must produce the SAME row_hash whether or not WouldBe is set.
+func TestWouldBeDoesNotChangeRowHash(t *testing.T) {
+	base := Record{
+		Timestamp: "2026-07-09T00:00:00Z",
+		Method:    "POST",
+		Host:      "api.example.com",
+		Path:      "/x",
+		Decision:  "allow",
+		Enforced:  false,
+		Surface:   "twitter",
+	}
+
+	// Bare row: no WouldBe.
+	r1 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "a.json"))
+	r1.AddGoverned(base)
+	bareHash := r1.pending[0].RowHash
+
+	// Same core fields, but WouldBe populated (an observe-mode would-be deny).
+	r2 := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "b.json"))
+	withWB := base
+	withWB.WouldBe = "deny"
+	r2.AddGoverned(withWB)
+	wbHash := r2.pending[0].RowHash
+
+	if bareHash != wbHash {
+		t.Fatalf("WouldBe changed row_hash:\n bare=%s\n   wb=%s", bareHash, wbHash)
+	}
+	// The field still survives on the row for the console/audit.
+	if r2.pending[0].WouldBe != "deny" {
+		t.Fatalf("WouldBe lost from row: got %q", r2.pending[0].WouldBe)
+	}
+}
+
 // AddGoverned stamps Origin="runtime" and preserves the caller metadata on the
 // row, while the existing proxy Add path stays Origin="proxy".
 func TestOriginTagging(t *testing.T) {

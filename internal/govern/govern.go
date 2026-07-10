@@ -65,6 +65,22 @@ type Config struct {
 	// "ask" (human approval) or "deny" — but never loosen a CP-signed deny. A nil
 	// Overlay disables it. See internal/overlay.
 	Overlay *overlay.Store
+
+	// Observer is an optional learn-mode behaviour hook. When set, it is called
+	// once per governed decision with the semantic action, caller principal, the
+	// would-be verdict, and whether that verdict was enforced. A nil Observer (the
+	// default) is a no-op. See internal/sinks.Behaviour.
+	Observer BehaviourObserver
+}
+
+// BehaviourObserver receives one call per governed decision so learn-mode can
+// build a behaviour profile of what agents actually do (and what a rule WOULD
+// have blocked). wouldBe is the verdict the policy/overlay would impose
+// ("allow"|"ask"|"deny"); enforced reports whether it was actually applied (an
+// observe-mode overlay rule reports enforced=false with wouldBe set to its
+// deny/ask). Implementations MUST NOT block: this runs on the decision path.
+type BehaviourObserver interface {
+	Observe(sem normalize.Action, principal, wouldBe string, enforced bool)
 }
 
 // Server is the PDP. It owns the socket lifecycle and delegates decisions to OPA
@@ -246,6 +262,11 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		dec = s.failMode(req)
 	}
 
+	// wouldBe is the verdict an observe-mode overlay rule WOULD have imposed while
+	// leaving the effective decision untouched; it is recorded (not enforced) and
+	// handed to the behaviour observer. Empty means no observe rule matched.
+	var wouldBe string
+
 	// Tighten-only local overlay: consulted only when the base policy ALLOWED the
 	// action. It can escalate an allow to "ask" (owner approval) or "deny" but can
 	// never loosen a signed deny, so local rules only ever add friction. Unlike the
@@ -270,7 +291,13 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		if r, ok := s.cfg.Overlay.Match(act); ok {
 			dec.PolicyID = r.ID
 			dec.Reason = "local_overlay: " + r.Reason
-			if r.Verdict == overlay.VerdictAsk {
+			if r.Observe {
+				// Observe mode: record the would-be verdict but do NOT change the
+				// effective allow. Enforced=false marks the row non-enforcing so the
+				// audit/console show it as "would have blocked".
+				wouldBe = string(r.Verdict)
+				dec.Enforced = false
+			} else if r.Verdict == overlay.VerdictAsk {
 				dec.Verdict = VerdictAsk
 			} else {
 				dec.Allowed = false
@@ -312,7 +339,21 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		CallerSource:      req.Ctx.Caller.Source,
 		Verb:              sem.Verb,
 		Findings:          sem.Findings,
+		WouldBe:           wouldBe,
 	})
+
+	// Notify the behaviour observer once per decision. An observe-mode rule reports
+	// its would-be verdict as non-enforcing; every other decision reports the
+	// effective verdict as enforced. A nil Observer is a no-op.
+	if s.cfg.Observer != nil {
+		effectiveWouldBe := decision
+		enforced := true
+		if wouldBe != "" {
+			effectiveWouldBe = wouldBe
+			enforced = false
+		}
+		s.cfg.Observer.Observe(sem, req.Ctx.Caller.PrincipalID, effectiveWouldBe, enforced)
+	}
 
 	resp := &Response{
 		DecisionID: newDecisionID(),

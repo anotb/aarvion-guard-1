@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aarvion-ai/aarvion-guard/internal/decisions"
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
+	"github.com/aarvion-ai/aarvion-guard/internal/normalize"
 	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 )
@@ -461,6 +463,183 @@ func TestOverlaySemanticSurfaceVerbDeny(t *testing.T) {
 	req2.Ctx.Surface = "exec"
 	if out := decode(t, post(t, client, sock, testToken, req2)); out.Verdict != VerdictAllow {
 		t.Fatalf("bird search should stay allowed: got %q", out.Verdict)
+	}
+}
+
+// captureSink records every finalized decision row so a test can assert the
+// audit metadata the HTTP response doesn't carry (Enforced, WouldBe).
+type captureSink struct {
+	mu   sync.Mutex
+	rows []decisions.Record
+}
+
+func (c *captureSink) Record(rec decisions.Record) {
+	c.mu.Lock()
+	c.rows = append(c.rows, rec)
+	c.mu.Unlock()
+}
+
+func (c *captureSink) last() (decisions.Record, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.rows) == 0 {
+		return decisions.Record{}, false
+	}
+	return c.rows[len(c.rows)-1], true
+}
+
+// captureObserver records every BehaviourObserver call so a test can assert the
+// PDP invokes the observer with the would-be verdict + enforced flag.
+type captureObserver struct {
+	mu    sync.Mutex
+	calls []observeCall
+}
+
+type observeCall struct {
+	principal string
+	wouldBe   string
+	enforced  bool
+	surface   string
+	verb      string
+}
+
+func (o *captureObserver) Observe(sem normalize.Action, principal, wouldBe string, enforced bool) {
+	o.mu.Lock()
+	o.calls = append(o.calls, observeCall{
+		principal: principal, wouldBe: wouldBe, enforced: enforced,
+		surface: sem.Surface, verb: sem.Verb,
+	})
+	o.mu.Unlock()
+}
+
+func (o *captureObserver) last() (observeCall, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.calls) == 0 {
+		return observeCall{}, false
+	}
+	return o.calls[len(o.calls)-1], true
+}
+
+// startServerWithRecorder is startServer but lets the caller supply the recorder
+// (so a capture sink can be attached) and returns the recorder.
+func startServerWithRecorder(t *testing.T, cfg Config, pol *policy.Client, rec *decisions.Recorder) (*http.Client, string) {
+	t.Helper()
+	if cfg.SocketPath == "" {
+		cfg.SocketPath = shortSocketPath(t)
+	}
+	if cfg.Token == "" {
+		cfg.Token = testToken
+	}
+	cfg.PeerUID = uint32(os.Getuid())
+
+	srv := New(cfg, pol, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+	waitForSocket(t, cfg.SocketPath, errCh)
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", cfg.SocketPath)
+		},
+	}}
+	return client, cfg.SocketPath
+}
+
+// An Observe-marked overlay deny rule must NOT change the effective verdict (the
+// response stays allow), but the recorded row is marked non-enforcing with the
+// would-be deny, and the behaviour observer is called with those facts. This is
+// the learn-mode mechanic: watch what a rule WOULD block without blocking it.
+func TestObserveModeRecordsWouldBeAndStillAllows(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "observe-no-tweets",
+		Verdict: overlay.VerdictDeny,
+		Reason:  "would block tweets",
+		Enabled: true,
+		Observe: true,
+		Match: overlay.Match{
+			Surfaces: []string{"twitter"},
+			Verbs:    []string{"post"},
+		},
+	})
+
+	sink := &captureSink{}
+	obs := &captureObserver{}
+	rec := decisions.New("http://cp", "tenant", "entity", "tok", "dp", filepath.Join(t.TempDir(), "chain.json"))
+	rec.SetSink(sink)
+
+	client, sock := startServerWithRecorder(t, Config{Overlay: ov, Observer: obs}, opaStub(t, true), rec)
+
+	req := sampleRequest("n-observe", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "bird tweet hello"}
+	req.Ctx.Surface = "exec"
+
+	out := decode(t, post(t, client, sock, testToken, req))
+	if out.Verdict != VerdictAllow {
+		t.Fatalf("observe rule must not change verdict: got %q want allow", out.Verdict)
+	}
+
+	row, ok := sink.last()
+	if !ok {
+		t.Fatal("no decision row recorded")
+	}
+	if row.Decision != "allow" {
+		t.Fatalf("recorded decision: got %q want allow", row.Decision)
+	}
+	if row.Enforced {
+		t.Fatalf("observe row must be non-enforcing: Enforced=%v want false", row.Enforced)
+	}
+	if row.WouldBe != "deny" {
+		t.Fatalf("observe row WouldBe: got %q want deny", row.WouldBe)
+	}
+
+	call, ok := obs.last()
+	if !ok {
+		t.Fatal("behaviour observer not called")
+	}
+	if call.wouldBe != "deny" || call.enforced {
+		t.Fatalf("observer call: got wouldBe=%q enforced=%v want deny/false", call.wouldBe, call.enforced)
+	}
+	if call.surface != "twitter" || call.verb != "post" {
+		t.Fatalf("observer semantic: got surface=%q verb=%q want twitter/post", call.surface, call.verb)
+	}
+}
+
+// An enforcing (non-observe) overlay deny rule still denies AND still notifies
+// the observer, with enforced=true and the would-be = the actual verdict.
+func TestObserverCalledOnEnforcedDecision(t *testing.T) {
+	ov := testOverlay(t, overlay.Rule{
+		ID:      "enforce-no-tweets",
+		Verdict: overlay.VerdictDeny,
+		Reason:  "blocks tweets",
+		Enabled: true,
+		Match: overlay.Match{
+			Surfaces: []string{"twitter"},
+			Verbs:    []string{"post"},
+		},
+	})
+	obs := &captureObserver{}
+	rec := decisions.New("http://cp", "tenant", "entity", "tok", "dp", filepath.Join(t.TempDir(), "chain.json"))
+
+	client, sock := startServerWithRecorder(t, Config{Overlay: ov, Observer: obs}, opaStub(t, true), rec)
+
+	req := sampleRequest("n-enforced", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "bird tweet hello"}
+	req.Ctx.Surface = "exec"
+
+	out := decode(t, post(t, client, sock, testToken, req))
+	if out.Verdict != VerdictDeny {
+		t.Fatalf("enforce rule verdict: got %q want deny", out.Verdict)
+	}
+	call, ok := obs.last()
+	if !ok {
+		t.Fatal("observer not called on enforced decision")
+	}
+	if call.wouldBe != "deny" || !call.enforced {
+		t.Fatalf("observer call: got wouldBe=%q enforced=%v want deny/true", call.wouldBe, call.enforced)
 	}
 }
 

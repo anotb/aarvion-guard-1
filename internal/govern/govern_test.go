@@ -289,6 +289,38 @@ func TestDenyVerdict(t *testing.T) {
 	}
 }
 
+// A policy that sets x-aarvion-verdict=ask (with allowed=false) must surface as
+// an "ask" verdict with the prompt plumbed through, so the PEP can pause the tool
+// call for owner approval instead of hard-denying it.
+func TestAskVerdict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
+			"allowed":     false,
+			"http_status": 202,
+			"headers": map[string]string{
+				"x-aarvion-verdict": "ask",
+				"x-policy-violated": "govern.ask.approval_required.v1",
+				"x-policy-reason":   "approval required: demo",
+			},
+		}})
+	}))
+	t.Cleanup(srv.Close)
+	pol := policy.New(strings.TrimPrefix(srv.URL, "http://"))
+
+	client, sock := startServer(t, Config{}, pol)
+	resp := post(t, client, sock, testToken, sampleRequest("n-ask", "POST", "api.example.com"))
+	out := decode(t, resp)
+	if out.Verdict != VerdictAsk {
+		t.Fatalf("verdict: got %q want ask", out.Verdict)
+	}
+	if out.Ask == nil || out.Ask.Prompt == "" {
+		t.Fatalf("ask prompt not plumbed: %+v", out.Ask)
+	}
+	if out.Nonce != "n-ask" {
+		t.Fatalf("nonce not echoed: got %q", out.Nonce)
+	}
+}
+
 // With OPA unreachable, a non-read surface (send) must fail closed.
 func TestFailModeSendDenies(t *testing.T) {
 	client, sock := startServer(t, Config{}, unreachableOPA(t))

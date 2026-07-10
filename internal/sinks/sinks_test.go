@@ -240,7 +240,7 @@ func TestMetricsServerServesAndShutsDown(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close()
 
-	server := NewMetrics(addr, src)
+	server := NewMetrics(addr, src, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Serve(ctx) }()

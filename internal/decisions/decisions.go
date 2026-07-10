@@ -122,6 +122,7 @@ type Recorder struct {
 	pending []Record
 	sampled map[string]int
 	sink    Sink
+	meter   func(host, decision string)
 
 	denies  int
 	errors  int
@@ -135,6 +136,18 @@ type Recorder struct {
 func (r *Recorder) SetSink(s Sink) {
 	r.mu.Lock()
 	r.sink = s
+	r.mu.Unlock()
+}
+
+// SetMeter attaches an optional per-decision volume hook, called on every proxy
+// Add BEFORE allow-collapse. Unlike the sink (which sees the finalized, collapsed
+// audit stream), the meter observes true request volume, so a per-host meter
+// counts every repeat of an identical allow - the runaway-spend case collapse
+// would otherwise hide. A nil meter (the default) is skipped. Set once at
+// startup, before any decisions flow.
+func (r *Recorder) SetMeter(fn func(host, decision string)) {
+	r.mu.Lock()
+	r.meter = fn
 	r.mu.Unlock()
 }
 
@@ -188,6 +201,12 @@ func (r *Recorder) saveState(seq int, prev string) {
 func (r *Recorder) Add(method, host, path, decision, policyID, reason, redactions string, enforced bool, latencyMs int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Meter true volume before collapse, so per-host rate/spend reflects every
+	// request even when the audit/CP stream dedups repeated identical allows.
+	if r.meter != nil {
+		r.meter(host, decision)
+	}
 
 	// Collapse only *unmarked* allows (a plain OPA/essential allow). A marked allow
 	// carries an audit-critical reason - a break_glass bypass or an observe-mode

@@ -112,10 +112,21 @@ type RateLimit struct {
 //   - AuditJSONLPath: on-box append-only JSONL forensic copy of every decision.
 //   - MetricsAddr: addr for a tiny Prometheus /metrics HTTP endpoint.
 //   - DenyWebhookURL: URL to POST a small JSON payload to on each deny.
+//
+// When MetricsAddr is set, /metrics also carries per-destination-host series
+// (request counts split by decision, plus an estimated-spend gauge):
+//   - SpendPerRequest: USD cost of one allowed request to a host, keyed by exact
+//     host or a ".suffix" domain (".openai.com" covers api.openai.com). Hosts
+//     with no entry still get request counts but zero spend.
+//   - MaxMeteredHosts: cardinality cap on distinct host label series (default
+//     200); unconfigured hosts beyond it fold into an "other" bucket, while
+//     cost-configured hosts are always metered individually.
 type Observability struct {
-	AuditJSONLPath string `json:"audit_jsonl_path,omitempty"`
-	MetricsAddr    string `json:"metrics_addr,omitempty"`
-	DenyWebhookURL string `json:"deny_webhook_url,omitempty"`
+	AuditJSONLPath  string             `json:"audit_jsonl_path,omitempty"`
+	MetricsAddr     string             `json:"metrics_addr,omitempty"`
+	DenyWebhookURL  string             `json:"deny_webhook_url,omitempty"`
+	SpendPerRequest map[string]float64 `json:"spend_per_request,omitempty"`
+	MaxMeteredHosts int                `json:"max_metered_hosts,omitempty"`
 }
 
 // Govern configures the local Policy Decision Point: a Unix-socket server the

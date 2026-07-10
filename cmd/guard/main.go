@@ -477,14 +477,24 @@ func attachSinks(ctx context.Context, cfg *config.Config, rec *decisions.Recorde
 		rec.SetSink(m)
 	}
 
+	// Per-host request + estimated-spend meter feeding the /metrics endpoint.
+	// Built only when a metrics addr is configured (nothing would read it
+	// otherwise). It rides the Recorder's meter hook (pre-collapse), NOT the sink
+	// fanout, so repeated identical allows are counted in full for rate/spend.
+	var hostMeter *sinks.HostMeter
 	if obs.MetricsAddr != "" {
-		ms := sinks.NewMetrics(obs.MetricsAddr, rec)
+		hostMeter = sinks.NewHostMeter(obs.SpendPerRequest, obs.MaxMeteredHosts)
+		rec.SetMeter(hostMeter.Count)
+	}
+
+	if obs.MetricsAddr != "" {
+		ms := sinks.NewMetrics(obs.MetricsAddr, rec, hostMeter)
 		go func() {
 			if err := ms.Serve(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "[metrics] %v\n", err)
 			}
 		}()
-		fmt.Printf("metrics endpoint on http://%s/metrics\n", obs.MetricsAddr)
+		fmt.Printf("metrics endpoint on http://%s/metrics (per-host spend/rate series)\n", obs.MetricsAddr)
 	}
 
 	return cleanup

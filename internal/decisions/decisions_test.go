@@ -341,6 +341,31 @@ func TestMarkedAllowsNeverCollapse(t *testing.T) {
 	}
 }
 
+// The meter hook fires on every Add BEFORE allow-collapse, so repeated identical
+// allows (which the audit/sink stream dedups within the flush window) are still
+// counted in full - the runaway-spend case the per-host meter exists to catch.
+func TestMeterCountsPreCollapse(t *testing.T) {
+	r := New("http://cp", "t", "e", "tok", "dp", filepath.Join(t.TempDir(), "m.json"))
+	allows := 0
+	r.SetMeter(func(host, decision string) {
+		if host == "api.example.com" && decision == "allow" {
+			allows++
+		}
+	})
+
+	for i := 0; i < 5; i++ {
+		r.Add("GET", "api.example.com", "/x", "allow", "", "", "", true, 1)
+	}
+	// The audit stream collapses the 5 identical allows to a single queued row...
+	if len(r.pending) != 1 {
+		t.Fatalf("audit stream should collapse identical allows: got %d queued want 1", len(r.pending))
+	}
+	// ...but the meter saw every one.
+	if allows != 5 {
+		t.Fatalf("meter must count every pre-collapse allow: got %d want 5", allows)
+	}
+}
+
 // A nil sink (the default: no observability configured) must be safe - the
 // decision path just skips the hook.
 func TestNilSinkIsSafe(t *testing.T) {

@@ -30,6 +30,7 @@ import (
 	"github.com/aarvion-ai/aarvion-guard/internal/mitm"
 	"github.com/aarvion-ai/aarvion-guard/internal/opa"
 	"github.com/aarvion-ai/aarvion-guard/internal/overlay"
+	"github.com/aarvion-ai/aarvion-guard/internal/packs"
 	"github.com/aarvion-ai/aarvion-guard/internal/pair"
 	"github.com/aarvion-ai/aarvion-guard/internal/policy"
 	"github.com/aarvion-ai/aarvion-guard/internal/proxy"
@@ -500,6 +501,41 @@ func loadOverlay() *overlay.Store {
 	return st
 }
 
+// applyPacks compiles the operator's policy packs (~/.aarvion/packs.json) into
+// tighten-only overlay rules and merges them into the shared overlay store BEFORE
+// the govern server starts, so pack guardrails enforce from boot. Hand-authored
+// overlay rules are preserved; only prior "pack:"-prefixed rules are replaced, so
+// re-running is idempotent (no duplicate-id validation failure across restarts).
+// A missing packs.json is a no-op (the overlay is left exactly as loaded). Any
+// load/compile/replace error is logged and non-fatal — a bad pack file must not
+// stop the guard.
+func applyPacks(ov *overlay.Store) {
+	if ov == nil {
+		return
+	}
+	if _, err := os.Stat(config.PacksPath()); err != nil {
+		return // no packs.json → leave the overlay as-is
+	}
+	ps, err := packs.Load(config.PacksPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[packs] disabled: %v\n", err)
+		return
+	}
+	compiled := packs.CompileOverlay(ps.Set())
+	var merged []overlay.Rule
+	for _, r := range ov.Rules() {
+		if !strings.HasPrefix(r.ID, "pack:") {
+			merged = append(merged, r) // keep hand-authored rules
+		}
+	}
+	merged = append(merged, compiled...)
+	if err := ov.Replace(merged); err != nil {
+		fmt.Fprintf(os.Stderr, "[packs] not applied: %v\n", err)
+		return
+	}
+	fmt.Printf("applied %d pack rules to the local overlay\n", len(compiled))
+}
+
 // reloadOverlay re-reads overlay.json on a ticker so out-of-band edits (a hand
 // edit, or a future cloud pull) are picked up without a restart. Console edits
 // already update the shared in-memory store; this only covers external writers.
@@ -625,6 +661,9 @@ func cmdRun() {
 	// in-process immediately. loadOverlay tolerates a missing file (empty store); a
 	// background reloader also picks up out-of-band edits to overlay.json.
 	ov := loadOverlay()
+	// Compile the operator's policy packs into the overlay BEFORE the govern server
+	// starts, so pack guardrails enforce from boot. No-op when packs.json is absent.
+	applyPacks(ov)
 	if ov != nil {
 		go reloadOverlay(ctx, ov)
 	}
@@ -702,18 +741,36 @@ func cmdRun() {
 	go rec.RunPush(ctx, 10*time.Second)
 	go hb.Run(ctx, 15*time.Second)
 
+	// Always-on learn-mode behaviour observer: it records what each agent actually
+	// does per {principal,surface,verb} so observe-mode packs and the propose step
+	// have real usage to reason about. Low overhead (in-memory tally, disk write off
+	// the hot path). nil-safe: a construction failure just leaves Observer unset.
+	behaviour := sinks.NewBehaviour(config.BehaviourProfilePath(), 0)
+	if behaviour != nil {
+		go behaviour.Run(ctx)
+		defer func() { _ = behaviour.Close() }()
+	}
+
 	// The runtime PDP is optional: only start it when a socket is configured.
 	// It shares the policy client + recorder with the proxy, so both governance
 	// paths write to the same OPA and decision chain.
 	if cfg.Govern.Socket.Path != "" {
-		gsrv := govern.New(govern.Config{
+		gcfg := govern.Config{
 			SocketPath: cfg.Govern.Socket.Path,
 			Token:      cfg.Govern.Socket.Token,
 			PeerUID:    cfg.Govern.Socket.PeerUID,
 			FailMode:   cfg.Govern.FailMode,
 			Essential:  mitm.Essentials(essentialHosts(cfg)),
 			Overlay:    ov,
-		}, pol, rec)
+		}
+		// Only set the interface when we actually built an observer, so a nil
+		// *Behaviour never becomes a non-nil typed-nil interface (which would
+		// panic on the decision path). NewBehaviour doesn't return nil today; this
+		// keeps it correct if that ever changes.
+		if behaviour != nil {
+			gcfg.Observer = behaviour
+		}
+		gsrv := govern.New(gcfg, pol, rec)
 		go func() {
 			if err := gsrv.ListenAndServe(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "[govern] %v\n", err)

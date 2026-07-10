@@ -87,3 +87,30 @@ type Response struct {
 type Ask struct {
 	Prompt string `json:"prompt,omitempty"`
 }
+
+// Approver is the human-in-the-loop hook behind an "ask" verdict. When the PDP's
+// final verdict is ask and an Approver is configured, decide() mints the
+// decision_id, calls Open with it (so the owner is notified over Telegram and the
+// pending shows in the console inbox), and returns ask + that id to the PEP
+// immediately - it never blocks on the human. The PEP then polls
+// GET /v1/approvals/{id}, whose handler answers from Status. A nil Approver keeps
+// today's behaviour: ask is returned but no pending is opened. See
+// internal/approve.Manager for the concrete implementation.
+type Approver interface {
+	// Open registers a pending approval for req.DecisionID. It must not block.
+	Open(req ApprovalRequest)
+	// Status reports the current verdict for id ("pending"|"allow"|"deny") and
+	// whether the id is known. An unknown id returns ("", false).
+	Status(id string) (verdict string, ok bool)
+}
+
+// ApprovalRequest describes an action awaiting owner approval. DecisionID is the
+// PDP-minted id the PEP polls on; the rest is the semantic summary the owner sees
+// (which agent, what surface/verb, and why the policy escalated).
+type ApprovalRequest struct {
+	DecisionID string
+	Principal  string
+	Surface    string
+	Verb       string
+	Reason     string
+}

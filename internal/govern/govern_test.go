@@ -643,6 +643,193 @@ func TestObserverCalledOnEnforcedDecision(t *testing.T) {
 	}
 }
 
+// fakeApprover records Open calls and answers Status from a canned verdict, so a
+// test can assert the PDP opens a pending on ask and the approvals endpoint
+// reports it.
+type fakeApprover struct {
+	mu      sync.Mutex
+	opened  []ApprovalRequest
+	verdict string // returned by Status for a known id
+	known   bool   // whether Status reports the id at all
+}
+
+func (f *fakeApprover) Open(req ApprovalRequest) {
+	f.mu.Lock()
+	f.opened = append(f.opened, req)
+	f.known = true
+	if f.verdict == "" {
+		f.verdict = "pending"
+	}
+	f.mu.Unlock()
+}
+
+func (f *fakeApprover) Status(id string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.known {
+		return "", false
+	}
+	return f.verdict, true
+}
+
+func (f *fakeApprover) lastOpened() (ApprovalRequest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.opened) == 0 {
+		return ApprovalRequest{}, false
+	}
+	return f.opened[len(f.opened)-1], true
+}
+
+// askOPA returns a policy client whose OPA always answers ask (allowed=false +
+// x-aarvion-verdict=ask), so the decision is an ask regardless of the request.
+func askOPA(t *testing.T) *policy.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
+			"allowed":     false,
+			"http_status": 202,
+			"headers": map[string]string{
+				"x-aarvion-verdict": "ask",
+				"x-policy-violated": "govern.ask.approval_required.v1",
+				"x-policy-reason":   "approval required",
+			},
+		}})
+	}))
+	t.Cleanup(srv.Close)
+	return policy.New(strings.TrimPrefix(srv.URL, "http://"))
+}
+
+// getApproval issues GET /v1/approvals/{id} over the same socket, returning the
+// raw response so a test can assert status + body.
+func getApproval(t *testing.T, client *http.Client, id, token string) *http.Response {
+	t.Helper()
+	hr, err := http.NewRequest(http.MethodGet, "http://unix/v1/approvals/"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		hr.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(hr)
+	if err != nil {
+		t.Fatalf("get approval: %v", err)
+	}
+	return resp
+}
+
+// An ask decision must register a pending with the Approver (using the SAME
+// decision_id returned to the PEP), and GET /v1/approvals/{id} must report it.
+func TestAskOpensPendingAndApprovalsEndpointReports(t *testing.T) {
+	appr := &fakeApprover{}
+	client, sock := startServer(t, Config{Approver: appr}, askOPA(t))
+
+	req := sampleRequest("n-ask-open", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "gog gmail send --to a@x.com"}
+	req.Ctx.Surface = "exec"
+	req.Ctx.Caller.PrincipalID = "llm-mail"
+
+	out := decode(t, post(t, client, sock, testToken, req))
+	if out.Verdict != VerdictAsk {
+		t.Fatalf("verdict: got %q want ask", out.Verdict)
+	}
+	if out.DecisionID == "" {
+		t.Fatal("ask response missing decision_id")
+	}
+
+	opened, ok := appr.lastOpened()
+	if !ok {
+		t.Fatal("Approver.Open not called on ask")
+	}
+	if opened.DecisionID != out.DecisionID {
+		t.Fatalf("pending id %q != response decision_id %q", opened.DecisionID, out.DecisionID)
+	}
+	if opened.Principal != "llm-mail" {
+		t.Fatalf("pending principal: got %q want llm-mail", opened.Principal)
+	}
+	if opened.Surface != "email" || opened.Verb != "send" {
+		t.Fatalf("pending semantic: got surface=%q verb=%q want email/send", opened.Surface, opened.Verb)
+	}
+	if opened.Reason == "" {
+		t.Fatal("pending reason empty")
+	}
+
+	resp := getApproval(t, client, out.DecisionID, testToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("approvals endpoint: got %d want 200", resp.StatusCode)
+	}
+	var body struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode approval: %v", err)
+	}
+	if body.Status != "pending" {
+		t.Fatalf("approval status: got %q want pending", body.Status)
+	}
+}
+
+// The approvals endpoint reflects a resolved verdict once the Approver flips it.
+func TestApprovalsEndpointReportsResolvedVerdict(t *testing.T) {
+	appr := &fakeApprover{verdict: "allow"}
+	client, sock := startServer(t, Config{Approver: appr}, askOPA(t))
+
+	req := sampleRequest("n-ask-resolved", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "gog gmail send --to a@x.com"}
+	req.Ctx.Surface = "exec"
+	out := decode(t, post(t, client, sock, testToken, req))
+
+	resp := getApproval(t, client, out.DecisionID, testToken)
+	defer resp.Body.Close()
+	var body struct {
+		Status string `json:"status"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body.Status != "allow" {
+		t.Fatalf("resolved status: got %q want allow", body.Status)
+	}
+}
+
+// An unknown decision id on the approvals endpoint is a 404.
+func TestApprovalsEndpointUnknownID(t *testing.T) {
+	client, _ := startServer(t, Config{Approver: &fakeApprover{}}, opaStub(t, true))
+	resp := getApproval(t, client, "does-not-exist", testToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown id: got %d want 404", resp.StatusCode)
+	}
+}
+
+// The approvals endpoint is peer+token gated like /v1/govern: no token → 401.
+func TestApprovalsEndpointRequiresToken(t *testing.T) {
+	client, _ := startServer(t, Config{Approver: &fakeApprover{}}, opaStub(t, true))
+	resp := getApproval(t, client, "any", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: got %d want 401", resp.StatusCode)
+	}
+}
+
+// With no Approver configured the PDP behaves as today: an ask verdict is still
+// returned to the PEP, no pending is opened, and the approvals endpoint 404s.
+func TestAskWithoutApproverStillAsks(t *testing.T) {
+	client, sock := startServer(t, Config{}, askOPA(t))
+	req := sampleRequest("n-ask-noappr", "POST", "api.example.com")
+	req.Action = Action{Tool: "exec", Args: "gog gmail send --to a@x.com"}
+	req.Ctx.Surface = "exec"
+	out := decode(t, post(t, client, sock, testToken, req))
+	if out.Verdict != VerdictAsk {
+		t.Fatalf("verdict: got %q want ask", out.Verdict)
+	}
+	resp := getApproval(t, client, out.DecisionID, testToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("no approver → approvals endpoint should 404: got %d", resp.StatusCode)
+	}
+}
+
 // The overlay is tighten-only: when the base policy DENIES, a matching overlay
 // rule must not be consulted and can never loosen the deny.
 func TestOverlayNeverLoosensBaseDeny(t *testing.T) {

@@ -71,6 +71,13 @@ type Config struct {
 	// would-be verdict, and whether that verdict was enforced. A nil Observer (the
 	// default) is a no-op. See internal/sinks.Behaviour.
 	Observer BehaviourObserver
+
+	// Approver is the optional human-in-the-loop hook behind an "ask" verdict. When
+	// set, decide() opens a pending for the final ask (under the decision_id it
+	// returns to the PEP) and the GET /v1/approvals/{id} route reports its status.
+	// A nil Approver (the default) keeps today's behaviour: ask is returned but no
+	// pending is opened. See internal/approve.Manager.
+	Approver Approver
 }
 
 // BehaviourObserver receives one call per governed decision so learn-mode can
@@ -136,6 +143,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/govern", s.handleGovern)
 	mux.HandleFunc("/v1/govern/health", s.handleHealth)
+	mux.HandleFunc("/v1/approvals/", s.handleApproval)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -251,6 +259,10 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 	start := s.nowFn()
 	hreq := req.Attributes.Request.HTTP
 
+	// Mint the decision_id up front: an ask verdict must open its pending under the
+	// SAME id we hand back to the PEP, so the PEP can poll GET /v1/approvals/{id}.
+	decisionID := newDecisionID()
+
 	// Classify the raw tool call into a typed semantic action once: the base OPA
 	// eval sees it as input.action.semantic, the tighten-only overlay matches its
 	// facets, and its Verb/Findings enrich the audit row. The normalizer is
@@ -355,8 +367,22 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		s.cfg.Observer.Observe(sem, req.Ctx.Caller.PrincipalID, effectiveWouldBe, enforced)
 	}
 
+	// On a final ask, register a pending with the approver (if configured) under
+	// the decision_id we return, so the owner is notified and the PEP can poll
+	// GET /v1/approvals/{id}. Open must not block: human approval can take minutes,
+	// and this socket has a 20s write timeout, so we return ask immediately.
+	if verdict == VerdictAsk && s.cfg.Approver != nil {
+		s.cfg.Approver.Open(ApprovalRequest{
+			DecisionID: decisionID,
+			Principal:  req.Ctx.Caller.PrincipalID,
+			Surface:    sem.Surface,
+			Verb:       sem.Verb,
+			Reason:     dec.Reason,
+		})
+	}
+
 	resp := &Response{
-		DecisionID: newDecisionID(),
+		DecisionID: decisionID,
 		Nonce:      req.Nonce,
 		Verdict:    verdict,
 		HTTPStatus: dec.HTTPStatus,
@@ -368,6 +394,43 @@ func (s *Server) decide(ctx context.Context, req *Request) *Response {
 		resp.Ask = &Ask{Prompt: dec.Reason}
 	}
 	return resp
+}
+
+// handleApproval serves GET /v1/approvals/{id}: it reports a pending approval's
+// current status ("pending"|"allow"|"deny") so the PEP can poll it after an ask.
+// It is peer+token gated exactly like /v1/govern. An unknown id (or no Approver
+// configured) is a 404, which the PEP treats as fail-safe (deny). The id is the
+// trailing path segment.
+func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.peerOK(r) {
+		http.Error(w, "peer not permitted", http.StatusForbidden)
+		return
+	}
+	if !s.tokenOK(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/v1/approvals/")
+	if id == "" {
+		http.Error(w, "approval id required", http.StatusBadRequest)
+		return
+	}
+	if s.cfg.Approver == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	status, ok := s.cfg.Approver.Status(id)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": status})
 }
 
 // buildInput assembles the extended OPA input from the request: the http block

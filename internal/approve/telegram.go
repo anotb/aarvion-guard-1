@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,7 +50,16 @@ type Telegram struct {
 	chatID   string
 	baseURL  string
 	client   *http.Client
+
+	// texts remembers each pending's message body by decision id so a resolution
+	// can rewrite the message to "<outcome> + original context" instead of a bare
+	// banner. Bounded so an unanswered backlog can't grow it without limit.
+	mu    sync.Mutex
+	texts map[string]string
 }
+
+// maxRememberedTexts caps the message-body cache (see Telegram.texts).
+const maxRememberedTexts = 512
 
 // NewTelegram builds a Telegram client for botToken posting to chatID. baseURL
 // is injectable for tests; an empty baseURL uses the public Bot API host. The
@@ -64,7 +74,27 @@ func NewTelegram(botToken, chatID, baseURL string) *Telegram {
 		chatID:   chatID,
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		client:   &http.Client{},
+		texts:    map[string]string{},
 	}
+}
+
+// rememberText caches a pending's message body (bounded); forgetText returns and
+// drops it. Used to give the resolution edit its original context.
+func (t *Telegram) rememberText(id, text string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.texts) >= maxRememberedTexts {
+		return
+	}
+	t.texts[id] = text
+}
+
+func (t *Telegram) forgetText(id string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	text := t.texts[id]
+	delete(t.texts, id)
+	return text
 }
 
 // method returns the full Bot API URL for a method name, e.g.
@@ -93,9 +123,11 @@ type sendMessageRequest struct {
 // non-2xx response or transport error is returned so the caller can fall back
 // to the console inbox.
 func (t *Telegram) Notify(p Pending) error {
+	text := notifyText(p)
+	t.rememberText(p.DecisionID, text)
 	req := sendMessageRequest{
 		ChatID: t.chatID,
-		Text:   notifyText(p),
+		Text:   text,
 	}
 	req.ReplyMarkup.InlineKeyboard = [][]inlineButton{{
 		{Text: "✅ Approve", CallbackData: p.DecisionID + ":" + VerdictAllow},
@@ -111,14 +143,13 @@ func (t *Telegram) Notify(p Pending) error {
 // verb and reason. The whole message is bounded to Telegram's text cap.
 func notifyText(p Pending) string {
 	var b strings.Builder
-	b.WriteString("Approval needed\n\n")
+	b.WriteString("🔔 Approval needed\n\n")
 	fmt.Fprintf(&b, "agent: %s\n", p.Principal)
-	fmt.Fprintf(&b, "action: %s %s\n", p.Surface, p.Verb)
+	fmt.Fprintf(&b, "action: %s %s", p.Surface, p.Verb)
 	if p.Reason != "" {
-		fmt.Fprintf(&b, "reason: %s\n", p.Reason)
+		fmt.Fprintf(&b, "\nreason: %s", p.Reason)
 	}
-	fmt.Fprintf(&b, "id: %s", p.DecisionID)
-	return boundText(b.String(), maxMessageText)
+	return boundText(strings.TrimRight(b.String(), "\n"), maxMessageText)
 }
 
 // boundText truncates s to at most n runes, appending an ellipsis marker when it
@@ -239,12 +270,12 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 	// message to the outcome and drop the buttons. A tap that lost the race (or
 	// hit an already-resolved item) gets an "already decided" toast.
 	toast := "Already decided"
-	outcome := ""
+	banner := ""
 	if won {
 		if verdict == VerdictAllow {
-			toast, outcome = "Approved ✅", "✅ Approved by you"
+			toast, banner = "Approved ✅", "✅ APPROVED by you"
 		} else {
-			toast, outcome = "Denied ⛔", "⛔ Denied by you"
+			toast, banner = "Denied ⛔", "⛔ DENIED by you"
 		}
 	}
 
@@ -256,11 +287,20 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 		Text:            toast,
 	})
 	if won && u.CallbackQuery.Message != nil && u.CallbackQuery.Message.MessageID != 0 {
+		// Rewrite the message to "<outcome> + original context" and drop the
+		// buttons. The empty (non-nil) inline_keyboard is what removes them: a nil
+		// slice serializes to JSON null, which Telegram rejects, leaving the buttons
+		// and making the tap look like it did nothing.
+		text := banner
+		if orig := t.forgetText(id); orig != "" {
+			text = banner + "\n\n" + orig
+		}
 		edit := editMessageRequest{
 			ChatID:    t.chatID,
 			MessageID: u.CallbackQuery.Message.MessageID,
-			Text:      outcome,
+			Text:      boundText(text, maxMessageText),
 		}
+		edit.ReplyMarkup.InlineKeyboard = [][]inlineButton{}
 		_ = t.post(actx, t.method("editMessageText"), edit)
 	}
 }

@@ -295,6 +295,7 @@ func TestPollTapGivesFeedback(t *testing.T) {
 		answerText string
 		editedID   int64
 		editedText string
+		editRaw    string
 		editCalled = make(chan struct{}, 1)
 		sentUpdate atomic.Bool
 	)
@@ -327,6 +328,7 @@ func TestPollTapGivesFeedback(t *testing.T) {
 			mu.Lock()
 			editedID = req.MessageID
 			editedText = req.Text
+			editRaw = string(body)
 			mu.Unlock()
 			select {
 			case editCalled <- struct{}{}:
@@ -359,6 +361,12 @@ func TestPollTapGivesFeedback(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(editedText), "approv") {
 		t.Errorf("edited text: want an approved outcome, got %q", editedText)
+	}
+	// The buttons must be removed via an EMPTY inline_keyboard array; a nil slice
+	// serializes to "null", which Telegram rejects (Bad Request), leaving the
+	// buttons and making the tap look like it did nothing. Regression guard.
+	if !strings.Contains(editRaw, `"inline_keyboard":[]`) {
+		t.Errorf("editMessageText must send inline_keyboard:[] (not null) to drop buttons; got body %s", editRaw)
 	}
 }
 

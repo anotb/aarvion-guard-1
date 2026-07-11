@@ -7,10 +7,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// logf writes an operational line about the approver to stderr, matching the
+// guard's other stderr diagnostics. Silent failures on the approval path (a
+// getUpdates error, a tap that doesn't resolve) are impossible to diagnose
+// otherwise.
+func logf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[approve/telegram] "+format+"\n", args...)
+}
 
 // defaultTelegramBaseURL is the public Bot API host. Tests inject an
 // httptest.Server URL in its place; production leaves it empty (→ this default).
@@ -125,9 +134,23 @@ func boundText(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// answerCallbackRequest clears the spinner on a tapped inline button.
+// answerCallbackRequest clears the spinner on a tapped inline button and shows a
+// short toast (Text) so the owner gets immediate feedback that the tap landed.
 type answerCallbackRequest struct {
 	CallbackQueryID string `json:"callback_query_id"`
+	Text            string `json:"text,omitempty"`
+}
+
+// editMessageRequest rewrites the original approval message to its outcome and
+// drops the buttons (an empty inline_keyboard), so the resolved state is visible
+// and can't be tapped again.
+type editMessageRequest struct {
+	ChatID      string `json:"chat_id"`
+	MessageID   int64  `json:"message_id"`
+	Text        string `json:"text"`
+	ReplyMarkup struct {
+		InlineKeyboard [][]inlineButton `json:"inline_keyboard"`
+	} `json:"reply_markup"`
 }
 
 // getUpdatesRequest long-polls for new updates past offset.
@@ -146,6 +169,9 @@ type update struct {
 			ID       int64  `json:"id"`
 			Username string `json:"username"`
 		} `json:"from"`
+		Message *struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"message"`
 		Data string `json:"data"`
 	} `json:"callback_query"`
 }
@@ -173,6 +199,7 @@ func (t *Telegram) Poll(ctx context.Context, resolve func(id, verdict, who strin
 			if ctx.Err() != nil {
 				return
 			}
+			logf("getUpdates error (retrying): %v", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -203,15 +230,39 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 	if who == "" {
 		who = strconv.FormatInt(u.CallbackQuery.From.ID, 10)
 	}
-	resolve(id, verdict, who)
+	won := resolve(id, verdict, who)
+	logf("tap received id=%s verdict=%s who=%s resolved=%v", id, verdict, who, won)
 
-	// Best-effort: clear the client-side spinner. Failure to answer doesn't
-	// undo the resolution, so we ignore the error.
+	// Give the owner immediate, visible feedback. Without this the tap silently
+	// clears the spinner and the message is unchanged, so it looks like nothing
+	// happened. A toast confirms the tap; on the winning tap we also rewrite the
+	// message to the outcome and drop the buttons. A tap that lost the race (or
+	// hit an already-resolved item) gets an "already decided" toast.
+	toast := "Already decided"
+	outcome := ""
+	if won {
+		if verdict == VerdictAllow {
+			toast, outcome = "Approved ✅", "✅ Approved by you"
+		} else {
+			toast, outcome = "Denied ⛔", "⛔ Denied by you"
+		}
+	}
+
 	actx, cancel := context.WithTimeout(ctx, telegramRequestTimeout)
 	defer cancel()
+	// Best-effort throughout: feedback failing never undoes the resolution.
 	_ = t.post(actx, t.method("answerCallbackQuery"), answerCallbackRequest{
 		CallbackQueryID: u.CallbackQuery.ID,
+		Text:            toast,
 	})
+	if won && u.CallbackQuery.Message != nil && u.CallbackQuery.Message.MessageID != 0 {
+		edit := editMessageRequest{
+			ChatID:    t.chatID,
+			MessageID: u.CallbackQuery.Message.MessageID,
+			Text:      outcome,
+		}
+		_ = t.post(actx, t.method("editMessageText"), edit)
+	}
 }
 
 // parseCallbackData splits "<id>:<verdict>" and validates the verdict against

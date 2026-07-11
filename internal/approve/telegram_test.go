@@ -156,6 +156,7 @@ func TestPollDrivesResolveOnCallback(t *testing.T) {
 					"callback_query": {
 						"id": "cb1",
 						"from": {"id": 7, "username": "owner"},
+						"message": {"message_id": 555},
 						"data": "d1:allow"
 					}
 				}]}`))
@@ -282,6 +283,82 @@ func TestPollIgnoresMalformedUpdates(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Poll did not return after ctx cancel")
+	}
+}
+
+// TestPollTapGivesFeedback proves a tap gets visible feedback: answerCallbackQuery
+// is called WITH a toast text, and the original message is rewritten via
+// editMessageText to the outcome. Without this the tap looked like a no-op.
+func TestPollTapGivesFeedback(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		answerText string
+		editedID   int64
+		editedText string
+		editCalled = make(chan struct{}, 1)
+		sentUpdate atomic.Bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			if sentUpdate.CompareAndSwap(false, true) {
+				_, _ = w.Write([]byte(`{"ok":true,"result":[{"update_id":100,"callback_query":{"id":"cb1","from":{"id":7,"username":"owner"},"message":{"message_id":555},"data":"d1:allow"}}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
+			body, _ := io.ReadAll(r.Body)
+			var req struct {
+				Text string `json:"text"`
+			}
+			_ = json.Unmarshal(body, &req)
+			mu.Lock()
+			answerText = req.Text
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			body, _ := io.ReadAll(r.Body)
+			var req struct {
+				MessageID int64  `json:"message_id"`
+				Text      string `json:"text"`
+			}
+			_ = json.Unmarshal(body, &req)
+			mu.Lock()
+			editedID = req.MessageID
+			editedText = req.Text
+			mu.Unlock()
+			select {
+			case editCalled <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tg := NewTelegram("BOT123", "chat-42", srv.URL)
+	go tg.Poll(ctx, func(id, verdict, who string) bool { return true })
+
+	select {
+	case <-editCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("editMessageText was not called within 2s")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if answerText == "" {
+		t.Errorf("answerCallbackQuery: want a toast text, got empty")
+	}
+	if editedID != 555 {
+		t.Errorf("editMessageText message_id: want 555, got %d", editedID)
+	}
+	if !strings.Contains(strings.ToLower(editedText), "approv") {
+		t.Errorf("edited text: want an approved outcome, got %q", editedText)
 	}
 }
 

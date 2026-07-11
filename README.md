@@ -71,6 +71,13 @@ the CP-signed bundle on `beta.aarvion.ai`, so a pack you tune locally is
 enable-able against your live entity. Example rego lives in
 [`examples/packs/`](examples/packs/).
 
+**Cloud governance (beta).** The PDP also emits the control plane's
+`mcp-norm/v1` input block, so a policy authored in the `beta.aarvion.ai`
+dashboard (rule-builder conditions `mcp_tool` / `mcp_side_effects` /
+`mcp_caller_source`) governs the plugin's **tool actions**, not just egress — no
+control-plane change required. The layers, the exact rule API, and how to author
+a labeled policy are in [`docs/CP-INTEGRATION.md`](docs/CP-INTEGRATION.md).
+
 ## Learn mode — ship in observe, protect in one click
 
 You don't have to write policy from a cold start. Packs ship in **observe**: they

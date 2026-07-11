@@ -100,9 +100,29 @@ auth) or a purpose-minted **dev-key** (`POST /api/v1/agents/{tenant}/{agentId}/d
 then `Authorization: Bearer <dev-key>`. Label policies clearly (e.g. prefix
 `aarvion-plugin-`) so they are easy to find and remove.
 
-## End-to-end verification (recommended before trusting cloud rules)
+## End-to-end verification — and the enforcement gap we found
 
-Because the `subject → input path` compiler lives in the CP (remote), verify once
-that a cloud rule actually reaches the guard: create the `no-bird-writes` policy
-for your entity, let the guard pull the re-signed bundle, then drive a `bird tweet`
-through the PDP and confirm the base OPA denies it (not just the local overlay).
+We ran this end to end (create a policy for a live entity via the API → guard
+pulls the re-signed bundle → drive a `bird tweet`). Findings:
+
+- **Link 1 (guard emits mcp-norm) ✅** — the compiled policy rego on the guard reads
+  `input.mcp.tool.side_effects`, and the guard emits exactly that. Confirmed via
+  `curl localhost:8181/v1/policies` on the box (`policy/policies/<name>.rego`).
+- **Link 2 (CP policy matches) ✅** — the authored rule compiled correctly and
+  landed in the entity's signed bundle within one refresh (OPA `Bundle loaded`).
+- **Link 3 (it actually blocks) ❌ — the gap.** The `bird tweet` was **not** blocked
+  by the CP policy. The compiled rule went into `monitor_verdicts` (record-only),
+  because the CP has an **agent-level deploy-mode master switch** (`agent_modes`,
+  `cp/cp-api/db.py`): *absent row ⇒ `observing`*, and `observing` forces every
+  policy to monitor. The resolution module only enforces `deny_verdicts`. So **on
+  beta today no authored policy can block** — every agent defaults to observing and
+  nothing in the product flips it.
+
+The CP already has the switches — `PUT /api/v1/agents/{tenant}/{agent}/mode`
+(`enforcement`) and `PUT /api/v1/policies/{tenant}/{name}/mode` (`enforce`) — but
+the BFF proxies neither and the frontend has no toggle. **Fix: PR
+`feat/expose-enforcement-mode` to `aarvion-service-backend` (two routes +
+`cpClient` methods) and `aarvion-service-frontend` (a mode toggle).** After it
+ships, set the agent to `enforcement` (and the policy to `enforce`) and the CP
+policy blocks the plugin's actions end to end — every link is already proven
+except this switch.

@@ -74,3 +74,21 @@ one command, no local checkout.
 
 **Reminder for launch copy:** the tamper-proof guarantee needs guard + agent on
 **separate uids**; same-uid governs the decision path but isn't a hard boundary.
+
+---
+
+## Backlog: show the actual content being approved
+
+Today a Telegram/console approval shows `agent: llm-twitter · action: twitter post
+· reason: social_guard:write`. It should also show **what** is being approved — the
+actual tweet text, the email recipient + subject, the shell command, the message
+body — so the owner decides on substance, not just surface+verb.
+
+- Guard: thread the concrete content into the approval. `govern.ApprovalRequest`
+  already has the semantic action; add a bounded, redacted `Content` string
+  (the normalized command / `sem.Raw` / comms body, secret-scrubbed) →
+  `approve.Pending.Content` → `notifyText` and the console inbox row.
+- Redact secrets/PII in the shown content (reuse `normalize.ScanDLP` to mask
+  `ghp_…`/keys before display) so the approval prompt itself isn't a leak.
+- Bound to Telegram's 4096-char message cap (already have `boundText`).
+- Small change; deferred so it doesn't hold up the launch.

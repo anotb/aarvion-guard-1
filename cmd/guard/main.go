@@ -670,7 +670,7 @@ func buildApprover(ctx context.Context, cfg *config.Config) *approve.Manager {
 		tg = approve.NewTelegram(tgCfg.BotToken, tgCfg.ChatID, "")
 		// Long-poll for owner taps; each tap resolves the matching pending. Runs for
 		// the process lifetime, backing off on transport errors.
-		go tg.Poll(ctx, store.Resolve)
+		go tg.Poll(ctx, store.Resolve, store.Status)
 		fmt.Println("approvals: Telegram notifications active")
 	} else {
 		fmt.Println("approvals: console inbox only (no Telegram creds configured)")
@@ -879,6 +879,7 @@ func cmdRun() {
 			FailMode:   cfg.Govern.FailMode,
 			Essential:  mitm.Essentials(essentialHosts(cfg)),
 			Overlay:    ov,
+			EntityID:   cfg.EntityID,
 		}
 		// Only set the interface when we actually built an observer, so a nil
 		// *Behaviour never becomes a non-nil typed-nil interface (which would

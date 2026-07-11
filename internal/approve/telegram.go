@@ -219,7 +219,7 @@ type getUpdatesResponse struct {
 // offset advances past each consumed update so it is delivered once. Transport
 // errors and malformed updates are skipped without panicking; the loop backs
 // off briefly on error to avoid a hot spin.
-func (t *Telegram) Poll(ctx context.Context, resolve func(id, verdict, who string) bool) {
+func (t *Telegram) Poll(ctx context.Context, resolve func(id, verdict, who string) bool, status func(id string) (string, bool)) {
 	var offset int64
 	for {
 		if ctx.Err() != nil {
@@ -242,14 +242,18 @@ func (t *Telegram) Poll(ctx context.Context, resolve func(id, verdict, who strin
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
 			}
-			t.handleUpdate(ctx, u, resolve)
+			t.handleUpdate(ctx, u, resolve, status)
 		}
 	}
 }
 
-// handleUpdate processes a single update: a valid callback_query drives resolve
-// then answers the query. Anything malformed is ignored.
-func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, verdict, who string) bool) {
+// handleUpdate processes a single update: a valid callback_query drives resolve,
+// answers the query with a toast, and ALWAYS rewrites the message to the verdict
+// that actually stands (dropping the buttons) — even for a late tap on an
+// already-resolved/expired pending, so the message never stays frozen with live
+// buttons. status(id) yields the standing verdict when this tap didn't win the
+// race. Anything malformed is ignored.
+func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, verdict, who string) bool, status func(id string) (string, bool)) {
 	if u.CallbackQuery == nil {
 		return
 	}
@@ -264,20 +268,15 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 	won := resolve(id, verdict, who)
 	logf("tap received id=%s verdict=%s who=%s resolved=%v", id, verdict, who, won)
 
-	// Give the owner immediate, visible feedback. Without this the tap silently
-	// clears the spinner and the message is unchanged, so it looks like nothing
-	// happened. A toast confirms the tap; on the winning tap we also rewrite the
-	// message to the outcome and drop the buttons. A tap that lost the race (or
-	// hit an already-resolved item) gets an "already decided" toast.
-	toast := "Already decided"
-	banner := ""
-	if won {
-		if verdict == VerdictAllow {
-			toast, banner = "Approved ✅", "✅ APPROVED by you"
-		} else {
-			toast, banner = "Denied ⛔", "⛔ DENIED by you"
+	// The verdict that stands: what you tapped if you won the race, else whatever
+	// already resolved it (an earlier tap, or a timeout → deny).
+	final := verdict
+	if !won && status != nil {
+		if st, ok := status(id); ok {
+			final = st
 		}
 	}
+	toast, banner := outcomeStrings(final, won)
 
 	actx, cancel := context.WithTimeout(ctx, telegramRequestTimeout)
 	defer cancel()
@@ -286,11 +285,10 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 		CallbackQueryID: u.CallbackQuery.ID,
 		Text:            toast,
 	})
-	if won && u.CallbackQuery.Message != nil && u.CallbackQuery.Message.MessageID != 0 {
-		// Rewrite the message to "<outcome> + original context" and drop the
-		// buttons. The empty (non-nil) inline_keyboard is what removes them: a nil
-		// slice serializes to JSON null, which Telegram rejects, leaving the buttons
-		// and making the tap look like it did nothing.
+	if u.CallbackQuery.Message != nil && u.CallbackQuery.Message.MessageID != 0 {
+		// Rewrite to "<outcome> + original context" and drop the buttons. The empty
+		// (non-nil) inline_keyboard removes them; a nil slice serializes to JSON
+		// null, which Telegram rejects — the bug that left the buttons stuck.
 		text := banner
 		if orig := t.forgetText(id); orig != "" {
 			text = banner + "\n\n" + orig
@@ -302,6 +300,23 @@ func (t *Telegram) handleUpdate(ctx context.Context, u update, resolve func(id, 
 		}
 		edit.ReplyMarkup.InlineKeyboard = [][]inlineButton{}
 		_ = t.post(actx, t.method("editMessageText"), edit)
+	}
+}
+
+// outcomeStrings maps the standing verdict + whether this tap won it into the
+// toast and the message banner.
+func outcomeStrings(verdict string, won bool) (toast, banner string) {
+	switch {
+	case won && verdict == VerdictAllow:
+		return "Approved ✅", "✅ APPROVED by you"
+	case won && verdict == VerdictDeny:
+		return "Denied ⛔", "⛔ DENIED by you"
+	case verdict == VerdictAllow:
+		return "Already approved", "✅ Approved"
+	case verdict == VerdictDeny:
+		return "Already denied (or expired)", "⛔ Denied (or expired)"
+	default:
+		return "Already decided", "☑️ Decided"
 	}
 }
 

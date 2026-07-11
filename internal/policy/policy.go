@@ -66,6 +66,10 @@ type GovernInput struct {
 	Ctx             map[string]any `json:"ctx,omitempty"`
 	Action          map[string]any `json:"action,omitempty"`
 	Attributes      map[string]any `json:"attributes,omitempty"`
+	// Mcp is the normalized mcp-norm/v1 block the control plane's rule-builder
+	// conditions (mcp_tool/mcp_side_effects/mcp_caller_source/...) evaluate, so a
+	// CP-authored policy governs the guard's PDP actions, not just egress.
+	Mcp map[string]any `json:"mcp,omitempty"`
 }
 
 // HTTPAttributes builds the attributes.request.http block shared by Eval and

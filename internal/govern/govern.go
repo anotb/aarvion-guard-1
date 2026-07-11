@@ -60,6 +60,10 @@ type Config struct {
 	FailMode   map[string]string
 	Essential  mitm.EssentialSet
 
+	// EntityID is this guard's paired entity, stamped into the mcp-norm/v1 input
+	// block so CP-authored policies can scope by entity. Optional.
+	EntityID string
+
 	// Overlay is an optional tighten-only local override set. On the PDP path it's
 	// consulted only when the base policy ALLOWED the action, and can escalate to
 	// "ask" (human approval) or "deny" — but never loosen a CP-signed deny. A nil
@@ -461,7 +465,82 @@ func (s *Server) buildInput(req *Request, sem normalize.Action) policy.GovernInp
 			"semantic":    semanticInput(sem),
 		},
 		Attributes: policy.HTTPAttributes(h.Method, h.Host, h.Path, h.Body, h.Headers),
+		Mcp:        s.mcpInput(req, sem),
 	}
+}
+
+// mcpInput emits the mcp-norm/v1 block (https://aarvion.ai/mcp-norm/v1) the
+// control plane's rule-builder conditions read: mcp_tool -> mcp.tool.name,
+// mcp_side_effects -> mcp.tool.side_effects, mcp_caller_source -> mcp.caller.source,
+// mcp_method -> mcp.jsonrpc_method. Emitting it here lets a CP-authored policy
+// govern the guard's PDP tool actions (not just egress), using the CP's existing
+// contract. The semantic surface/verb are also carried under mcp.openclaw for a
+// future verb-granular CP contract; today's mcp_surface is the const "mcp".
+func (s *Server) mcpInput(req *Request, sem normalize.Action) map[string]any {
+	method := req.Action.Operation
+	if method == "" {
+		method = "tools/call"
+	}
+	toolName := sem.Binary
+	if toolName == "" {
+		toolName = req.Action.Tool
+	}
+	return map[string]any{
+		"surface":        "mcp",
+		"entity_id":      s.cfg.EntityID,
+		"direction":      "host_to_server",
+		"jsonrpc_method": method,
+		"caller": map[string]any{
+			"principal_id": nullIfEmpty(req.Ctx.Caller.PrincipalID),
+			"session_id":   nullIfEmpty(req.Ctx.Caller.SessionID),
+			"source":       mcpCallerSource(req.Ctx.Caller),
+		},
+		"tool": map[string]any{
+			"name":              toolName,
+			"definition_hash":   "",
+			"side_effects":      mcpSideEffects(sem.Verb),
+			"approval_required": false,
+			"idempotent":        sem.Verb == "" || sem.Verb == "read",
+		},
+		"arguments":        req.Action.Args,
+		"contract_version": "mcp-norm/v1",
+		// Extension (not part of mcp-norm/v1): the OpenClaw semantic surface/verb,
+		// so a future CP contract can match verb-granular (twitter/post) rather than
+		// the coarse reversible/irreversible side-effect class.
+		"openclaw": map[string]any{"surface": sem.Surface, "verb": sem.Verb},
+	}
+}
+
+// mcpSideEffects maps a semantic verb to the mcp-norm/v1 side-effect class the CP's
+// mcp_side_effects condition matches: reversible | irreversible |
+// potentially_irreversible.
+func mcpSideEffects(verb string) string {
+	switch verb {
+	case "read", "":
+		return "reversible"
+	case "post", "reply", "dm", "follow", "like", "send", "share",
+		"delete", "force_push", "repo_delete", "push", "secret_set":
+		return "irreversible"
+	default:
+		return "potentially_irreversible"
+	}
+}
+
+// mcpCallerSource maps the caller into the mcp-norm/v1 source enum
+// (verified | self_asserted | unattributed). The PEP self-asserts identity, so a
+// present principal is self_asserted; absent identity is unattributed.
+func mcpCallerSource(c Caller) string {
+	if c.PrincipalID == "" {
+		return "unattributed"
+	}
+	return "self_asserted"
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // semanticInput flattens the normalized Action into the map OPA sees at

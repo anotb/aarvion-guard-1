@@ -847,3 +847,37 @@ func TestOverlayNeverLoosensBaseDeny(t *testing.T) {
 		t.Fatalf("base deny must stand: got %q want deny", out.Verdict)
 	}
 }
+
+// TestMcpNormInput asserts the guard emits the CP's mcp-norm/v1 input block so a
+// control-plane rule-builder policy (mcp_tool/mcp_side_effects/mcp_caller_source)
+// governs the guard's PDP tool actions.
+func TestMcpNormInput(t *testing.T) {
+	s := &Server{cfg: Config{EntityID: "agt_test"}}
+	req := &Request{
+		Ctx:    Ctx{Caller: Caller{PrincipalID: "llm-twitter", SessionID: "sess1", Source: "openclaw"}},
+		Action: Action{Tool: "Bash", Operation: "exec"},
+	}
+	sem := normalize.Action{Surface: "twitter", Verb: "post", Binary: "bird"}
+	m := s.mcpInput(req, sem)
+
+	if m["surface"] != "mcp" || m["entity_id"] != "agt_test" || m["contract_version"] != "mcp-norm/v1" {
+		t.Fatalf("mcp block top-level wrong: %+v", m)
+	}
+	tool := m["tool"].(map[string]any)
+	if tool["name"] != "bird" {
+		t.Errorf("tool.name = %v, want bird", tool["name"])
+	}
+	if tool["side_effects"] != "irreversible" {
+		t.Errorf("tool.side_effects = %v, want irreversible (a post is not reversible)", tool["side_effects"])
+	}
+	caller := m["caller"].(map[string]any)
+	if caller["source"] != "self_asserted" {
+		t.Errorf("caller.source = %v, want self_asserted", caller["source"])
+	}
+	if mcpSideEffects("read") != "reversible" {
+		t.Errorf("read should be reversible")
+	}
+	if mcpCallerSource(Caller{}) != "unattributed" {
+		t.Errorf("empty caller should be unattributed")
+	}
+}

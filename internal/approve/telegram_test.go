@@ -196,7 +196,7 @@ func TestPollDrivesResolveOnCallback(t *testing.T) {
 	tg := NewTelegram("BOT123", "chat-42", srv.URL)
 	done := make(chan struct{})
 	go func() {
-		tg.Poll(ctx, resolve)
+		tg.Poll(ctx, resolve, func(string) (string, bool) { return "", false })
 		close(done)
 	}()
 
@@ -268,7 +268,7 @@ func TestPollIgnoresMalformedUpdates(t *testing.T) {
 	tg := NewTelegram("BOT123", "chat-42", srv.URL)
 	done := make(chan struct{})
 	go func() {
-		tg.Poll(ctx, resolve)
+		tg.Poll(ctx, resolve, func(string) (string, bool) { return "", false })
 		close(done)
 	}()
 
@@ -344,7 +344,7 @@ func TestPollTapGivesFeedback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tg := NewTelegram("BOT123", "chat-42", srv.URL)
-	go tg.Poll(ctx, func(id, verdict, who string) bool { return true })
+	go tg.Poll(ctx, func(id, verdict, who string) bool { return true }, func(string) (string, bool) { return VerdictAllow, true })
 
 	select {
 	case <-editCalled:
@@ -367,6 +367,64 @@ func TestPollTapGivesFeedback(t *testing.T) {
 	// buttons and making the tap look like it did nothing. Regression guard.
 	if !strings.Contains(editRaw, `"inline_keyboard":[]`) {
 		t.Errorf("editMessageText must send inline_keyboard:[] (not null) to drop buttons; got body %s", editRaw)
+	}
+}
+
+// TestPollLateTapStillEdits is the regression for "everything says already
+// decided and the message never changes": a tap that LOST the race (resolve→false)
+// must still rewrite the message to the standing verdict and drop the buttons.
+func TestPollLateTapStillEdits(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		editRaw    string
+		editCalled = make(chan struct{}, 1)
+		sent       atomic.Bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			if sent.CompareAndSwap(false, true) {
+				_, _ = w.Write([]byte(`{"ok":true,"result":[{"update_id":100,"callback_query":{"id":"cb1","from":{"id":7,"username":"owner"},"message":{"message_id":99},"data":"d1:allow"}}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			editRaw = string(body)
+			mu.Unlock()
+			select {
+			case editCalled <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tg := NewTelegram("BOT", "chat", srv.URL)
+	// resolve loses the race; status says it already stands as deny (e.g. a timeout).
+	go tg.Poll(ctx,
+		func(id, verdict, who string) bool { return false },
+		func(id string) (string, bool) { return VerdictDeny, true })
+
+	select {
+	case <-editCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a late tap must still edit the message, but editMessageText was not called")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(editRaw, `"inline_keyboard":[]`) {
+		t.Errorf("late-tap edit must drop buttons via inline_keyboard:[]; got %s", editRaw)
+	}
+	if !strings.Contains(strings.ToLower(editRaw), "denied") {
+		t.Errorf("late-tap edit should show the standing (denied) verdict; got %s", editRaw)
 	}
 }
 
